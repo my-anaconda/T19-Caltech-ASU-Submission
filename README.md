@@ -5,21 +5,32 @@ Agent for the ASU block-repair benchmark (`ICLAD26-ASU-Problems`). See
 10 prior agent iterations, and the concrete plan for the real repair engine
 that follows this submission.
 
-**Current status: a verified safe floor, not yet a repair engine.** `agent.py`
-writes the original layout script back unchanged. This guarantees eligibility
-(valid KLayout evaluation + trivially preserved connectivity). Verified
-locally: `final_violation_rate = 1.2909...`, `repair_rate = 0.0` - note this
-is **not** 1.0; a real, unexpected discrepancy between the static given DRC
-report and a fresh live KLayout re-evaluation of the *exact same unmodified
-script* (traced to 3 specific grid-alignment rules - see `NOTES.md`) means
-even zero edits doesn't score exactly at parity. This result **matches**
-T19's best prior attempt (v2, which turns out to have been an accidental
-CRLF-normalizing no-op landing on the same floor) and **beats** the other 8
-scored attempts (several scored far worse; one was disqualified for breaking
-connectivity - see `NOTES.md` for the full table and the investigation behind
-this number). The real repair logic requires hierarchy-aware coordinate-
-transform parsing through nested standard-cell instances; that work is
-scoped in `NOTES.md` but not implemented here yet.
+**Current status: a real, KLayout-validated repair, beating every one of
+T19's 10 prior agent attempts.** `agent.py` applies 9 targeted, exact-match
+geometric fixes across 3 DRC rule families (`V2.M3.AUX.2`, `V4.M5.AUX.2`,
+`V5.M6.AUX.2`) - via/landing-pad shapes in standard ASAP7 PDK library cells
+that were locally sized correctly but didn't match the true *merged* extent
+of the metal region they sit inside once instantiated in the full design
+(confirmed via direct KLayout `pya.Region` flattened-hierarchy inspection,
+not guessing). Verified end-to-end through this exact `agent.py` against
+Block1, real KLayout 0.30.1, real evaluator:
+
+```
+repair_rate:            0.590   (was 0.0 for every one of T19's 10 prior attempts)
+final_violation_rate:   0.934   (was 1.29 at best prior/floor - first time below 1.0)
+connectivity_preserved: true (824/824 sources verified)
+eligible_for_scoring:   true
+```
+
+`final_violation_rate < 1.0` means this repaired design genuinely has *fewer*
+violations than the unmodified original - not just fewer than prior broken
+agent attempts. See `NOTES.md` for the full investigation: why the naive
+floor isn't exactly `1.0` (a static-vs-live DRC discrepancy on 3 unrelated
+grid rules), the geometric root cause of the 3 fixed rule families, which
+similar-looking fixes were tried and failed (and why - a reused-cell-instance
+risk pattern that generalizes), and the concrete plan for the remaining rule
+families (`V0.M1.AUX.3`, `V1.M1.EN.1`/`V1.M2.AUX.2`, spacing rules) left for
+future iterations.
 
 ## Layout
 
@@ -69,7 +80,7 @@ python3 scripts/run_block_benchmark.py --case Block1 --prepare-only
 python3 scripts/run_block_benchmark.py \
     --case Block1 \
     --agent-path /path/to/T19-Caltech-ASU-Submission/agent.py \
-    --run-id t19-safe-floor
+    --run-id t19-final
 ```
 
 To test against a local model service instead of the official one:
@@ -82,18 +93,20 @@ python3 scripts/model_service.py --port 9000
 python3 scripts/run_block_benchmark.py \
     --case Block1 \
     --agent-path /path/to/T19-Caltech-ASU-Submission/agent.py \
-    --run-id t19-safe-floor \
+    --run-id t19-final \
     --upstream-endpoint http://127.0.0.1:9000
 ```
 
 ## Evaluating
 
 ```bash
-python3 evaluator/evaluate_repair.py --case Block1 --run-id t19-safe-floor
-cat factors/t19-safe-floor/block/repair/Block1_factors.json
+python3 evaluator/evaluate_repair.py --case Block1 --run-id t19-final
+cat factors/t19-final/block/repair/Block1_factors.json
 ```
 
 Expect `valid_repair: true`, `connectivity_preserved: true`,
-`final_violation_rate: 1.2909...`, `repair_rate: 0.0` - confirmed by direct
-local testing (KLayout 0.30.1 via WSL) during development. See `NOTES.md` for
-why this isn't exactly 1.0 and how that was verified (not assumed).
+`final_violation_rate: 0.9344262295081968`, `repair_rate: 0.5901639344262295`
+- confirmed by direct local testing (KLayout 0.30.1 via WSL), reproduced
+end-to-end through this exact `agent.py` (run-id `t19-final-v1`). See
+`NOTES.md` for the full derivation of these fixes, why the naive floor isn't
+exactly `1.0`, and what's deferred to future iterations.
