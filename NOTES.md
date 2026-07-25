@@ -130,6 +130,72 @@ happens to reuse the same via cell definitions, and safely no-ops (with a
 logged skip reason) on cases that don't - see `agent.py`'s
 `apply_validated_fixes()`.
 
+## Generalizing beyond Block1 (v2)
+
+The first submitted version of `agent.py` implemented the three fixes above
+as **exact-string edits keyed to Block1's own variable names**
+(`p101 = pya.Polygon(...)` etc.). That was verified against Block1 only, and
+the README claimed it would "apply automatically wherever the same library
+cell recurs" - an assumption that was **wrong, and silently wrong**: tested
+directly against the other 4 available blocks, all 9 string-matches got 0
+hits on Block2/Block3/Block6/Block7. `agent.py` was quietly a no-op on 4 of
+5 available cases.
+
+**Root cause, confirmed by diffing Block1.py against Block2.py directly:**
+every block's script defines the same PDK via cells
+(`VIA_VIA23_1_3_36_36`, `VIA_VIA45_1_2_58_58`, `VIA_VIA56_2_2_66_58`) with
+**byte-identical local polygon coordinates** - but each block's script
+auto-generates its own sequential Python variable names (`p101` in Block1 is
+the same shape as `p75` in Block2), so a fix keyed to a literal variable name
+can only ever match the one block it was written against. This also explains
+why this matters a lot: these 3 rule families are large - 447 violations in
+Block7 alone, more than Block1's entire 244-violation total - so a fix that
+only fires on Block1 leaves most of the available scoring surface untouched.
+
+**The fix (v2): match structurally, not textually.** For each target via
+cell, `agent.py` now finds every `pXXX = pya.Polygon(...)` statement
+immediately followed by that specific cell's `.insert(pXXX)` call (regex,
+capturing the variable name as a backreference so the assignment and the
+insert are confirmed to refer to the same shape), groups the matches by GDS
+layer in each layer's own appearance order, and only applies edits if the
+found `{layer: shape_count}` structure **exactly** matches what was validated
+on Block1 - any missing layer, wrong shape count, or unexpected extra layer
+skips that entire cell (logged), never guesses. The per-position transforms
+(which shapes move, to exactly what coordinates) are unchanged from the
+original Block1 derivation - confirmed by diffing every violating shape for
+these 3 rules across all 5 blocks, they all have byte-identical *local*
+dimensions (72x72 / 96x96 / 96x128), and the target extents (136/480/640)
+are fixed PDK/design-grid constants, not values that need recomputing per
+block or per instance.
+
+**Safety re-checked, not assumed, for every block:** the core lesson from the
+`VIA_VIA12` failure below is that blind edits are only safe on
+low-instance-count cells. Re-verified instantiation counts for all 3 target
+cells across all 5 blocks: Block1 24/24/6, Block2 8/8/0, Block3 9/9/0, Block6
+26/26/8, Block7 75/75/18 - all well under the "hundreds+" danger zone
+`VIA_VIA12` (1326 instances) sits in.
+
+**Verified end-to-end, real KLayout 0.30.1, all 5 available blocks** (each
+compared against that block's own *true* pristine floor - a live re-run of
+the untouched script, not the naive `1.0` assumption, since Block1 already
+showed that assumption can be wrong by ~30%):
+
+| Case | Pristine floor (live) | Repaired `final_violation_rate` | `repair_rate` | `valid_repair` | `connectivity_preserved` |
+|---|---:|---:|---:|---|---|
+| Block1 | 1.2910 | 0.9344 | 0.5902 | true | true |
+| Block2 | 1.3235 | 0.9706 | 0.5882 | true | true |
+| Block3 | 1.2472 | 1.0000 | 0.5056 | true | true |
+| Block6 | 1.2996 | 0.9231 | 0.6559 | true | true |
+| Block7 | 1.2510 | 0.9203 | 0.5843 | true | true |
+
+Every block improves genuinely over its own true floor. Block3 lands exactly
+at the naive `1.0` (its `V5.M6.AUX.2`/`VIA_VIA56_2_2_66_58` cell isn't
+present in that block, so only 7 of the usual 9 edits apply there) but is
+still a real improvement relative to Block3's own true floor of 1.2472.
+Regression-checked: the new structural engine's output on Block1 is
+byte-for-byte identical to the original v1 hardcoded-string output, so
+nothing was lost in the rewrite.
+
 ## Fixes that didn't work (and why - important for future iterations)
 
 - **Naive V2 height fix (56, the isolated-cell height) instead of 68 (the

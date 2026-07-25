@@ -29,14 +29,22 @@ from 0.0 to 0.59 - the first genuine repairs recorded against this benchmark.
 
 These are the ASAP7 PDK's own standard via library cells (VIA_VIA23_1_3_36_36,
 VIA_VIA45_1_2_58_58, VIA_VIA56_2_2_66_58) - not Block1-specific - so the same
-exact-string edits are attempted on every case; they apply automatically
-wherever the same library cell (with the same local coordinates) recurs, and
-are inert (skipped, logged) wherever it doesn't, degrading gracefully to the
-safe floor rather than guessing. A DIFFERENT via cell family (VIA_VIA12, used
-far more ubiquitously throughout the design for base M1<->M2 vias) was
-attempted with the same technique and made things dramatically worse instead
-(see NOTES.md) - a reminder that "the same family of fix" is not automatically
-safe to generalize, which is why it is NOT included here.
+edits are attempted on every case. They match STRUCTURALLY (by via-cell name,
+GDS layer, and occurrence-index within that layer), not by literal source
+text: each block's script defines these same cells with byte-identical local
+geometry but different auto-generated variable names, so a naive exact-string
+match (v1 of this agent) silently no-op'd on every block except the one it
+was written against - see NOTES.md's "Generalizing beyond Block1" section.
+Structural matching applies automatically wherever the expected
+{layer: shape-count} structure is found, and is inert (skipped, logged)
+wherever it isn't, degrading gracefully to the safe floor rather than
+guessing. Verified via real KLayout DRC re-run + connectivity check against
+all 5 available blocks (Block1/2/3/6/7), each beating its own true pristine
+floor. A DIFFERENT via cell family (VIA_VIA12, used far more ubiquitously
+throughout the design for base M1<->M2 vias) was attempted with the same
+technique and made things dramatically worse instead (see NOTES.md) - a
+reminder that "the same family of fix" is not automatically safe to
+generalize, which is why it is NOT included here.
 
 Run via the benchmark runner:
   python3 scripts/run_block_benchmark.py --case Block1 --agent-path agent.py --run-id t19-v2
@@ -44,100 +52,155 @@ Run via the benchmark runner:
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 
 RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 
 
 # ---------------------------------------------------------------------------
-# Validated fixes. Each is an exact substring replacement, applied only if the
-# OLD text is found in the script EXACTLY ONCE (never applied on 0 or >1
-# matches, to avoid silently touching the wrong shape or double-applying).
-# Every one of these was verified via a real KLayout render+DRC re-run against
-# Block1 before being included here - see NOTES.md for the full derivation.
+# Validated fixes, applied structurally rather than by literal-text match.
+#
+# Originally (v1) these were exact-string edits keyed to Block1's specific
+# variable names (p101, p103, ...). That worked for Block1 but silently
+# no-op'd on every other block: each block's script defines the SAME PDK via
+# cells with the SAME local polygon coordinates, but auto-generated variable
+# names differ per block (e.g. Block1's p101 is Block2's p75) - confirmed by
+# direct diffing of Block1.py/Block2.py's cell definitions. So the fix now
+# matches structurally: for each target via cell, find its constituent
+# pXXX = pya.Polygon(...) / cell_<NAME>.shapes(...).insert(pXXX) statement
+# pairs, group them by GDS layer (preserving each layer's own appearance
+# order), and require the found (layer -> shape count) structure to exactly
+# match what was validated on Block1 before touching anything - otherwise the
+# whole cell is skipped and logged, never guessed at.
+#
+# The per-position transforms themselves (which shapes move, and to exactly
+# what coordinates) are unchanged from the original Block1 derivation - see
+# NOTES.md. Confirmed via direct diffing of Block1/2/3/6/7 that every
+# violating shape for these 3 rules has byte-identical local dimensions
+# (72x72 / 96x96 / 96x128) in every block that has them, and the target
+# extents (136/480/640) are fixed PDK/design-grid constants, not values that
+# need to be recomputed per block - so the same validated target coordinates
+# apply everywhere the structural shape matches.
 # ---------------------------------------------------------------------------
-VALIDATED_FIXES = [
-    {
-        "rule": "V2.M3.AUX.2",
-        "description": (
-            "VIA_VIA23_1_3_36_36: grow the M2 landing pad and all 3 V2 vias "
-            "from Y=+/-36 to Y=+/-68 to match M3's true flattened/merged "
-            "perpendicular extent (136), while keeping V2 'inside M2' (V2.AUX.1)."
-        ),
-        "old": "p101 = pya.Polygon([pya.Point(-200, -36), pya.Point(-200, 36), pya.Point(200, 36), pya.Point(200, -36)])",
-        "new": "p101 = pya.Polygon([pya.Point(-200, -68), pya.Point(-200, 68), pya.Point(200, 68), pya.Point(200, -68)])",
+
+def _grow_y(half):
+    """Keep the shape's X range, set its Y range to +/-half."""
+    def _t(x0, y0, x1, y1, x2, y2, x3, y3):
+        return (x0, -half, x1, half, x2, half, x3, -half)
+    return _t
+
+
+def _grow_x(half):
+    """Keep the shape's Y range, set its X range to +/-half."""
+    def _t(x0, y0, x1, y1, x2, y2, x3, y3):
+        return (-half, y0, -half, y1, half, y2, half, y3)
+    return _t
+
+
+# cell name -> { layer: [transform_or_None, ...] } in each layer's own
+# file-appearance order. `None` means "found here, but intentionally left
+# unchanged" (either already correct, or a deliberately-deferred edit - see
+# NOTES.md's "Fixes that didn't work" for why not every shape in a matched
+# cell gets touched).
+CELL_FIX_SPECS = {
+    # V2.M3.AUX.2: M2 landing pad + all 3 V2 vias, Y half-extent 36 -> 68
+    # (M3's true flattened/merged perpendicular extent is 136).
+    "VIA_VIA23_1_3_36_36": {
+        20: [_grow_y(68)],                       # M2 landing pad
+        30: [None],                               # unrelated shape, untouched
+        25: [_grow_y(68), _grow_y(68), _grow_y(68)],  # 3x V2 via
     },
-    {
-        "rule": "V2.M3.AUX.2",
-        "old": "p103 = pya.Polygon([pya.Point(108, -36), pya.Point(108, 36), pya.Point(180, 36), pya.Point(180, -36)])",
-        "new": "p103 = pya.Polygon([pya.Point(108, -68), pya.Point(108, 68), pya.Point(180, 68), pya.Point(180, -68)])",
+    # V4.M5.AUX.2 / V4.M4.EN.1: M4 pad X half-extent 208 -> 284 (keeps V4
+    # enclosed per V4.M4.EN.1); both V4 vias -> X +/-240 (M5's true merged
+    # perpendicular extent is 480).
+    "VIA_VIA45_1_2_58_58": {
+        50: [None],
+        40: [_grow_x(284)],                       # M4 landing pad
+        45: [_grow_x(240), _grow_x(240)],          # 2x V4 via
     },
-    {
-        "rule": "V2.M3.AUX.2",
-        "old": "p104 = pya.Polygon([pya.Point(-36, -36), pya.Point(-36, 36), pya.Point(36, 36), pya.Point(36, -36)])",
-        "new": "p104 = pya.Polygon([pya.Point(-36, -68), pya.Point(-36, 68), pya.Point(36, 68), pya.Point(36, -68)])",
+    # V5.M6.AUX.2: 2 of 4 V5 vias -> Y +/-320 (M6's true merged perpendicular
+    # extent is 640). The other 2 are left unchanged - they become a
+    # harmless subset of the newly-grown pair at the same X range.
+    "VIA_VIA56_2_2_66_58": {
+        50: [None],
+        60: [None],                                # already at the correct extent
+        55: [_grow_y(320), _grow_y(320), None, None],  # 4x V5 via, only first 2 grown
     },
-    {
-        "rule": "V2.M3.AUX.2",
-        "old": "p105 = pya.Polygon([pya.Point(-180, -36), pya.Point(-180, 36), pya.Point(-108, 36), pya.Point(-108, -36)])",
-        "new": "p105 = pya.Polygon([pya.Point(-180, -68), pya.Point(-180, 68), pya.Point(-108, 68), pya.Point(-108, -68)])",
-    },
-    {
-        "rule": "V4.M5.AUX.2 / V4.M4.EN.1",
-        "description": (
-            "VIA_VIA45_1_2_58_58: grow the M4 landing pad to X=+/-284 (44 units / "
-            "11nm beyond the via, satisfying V4.M4.EN.1 enclosure) and both V4 "
-            "vias to X=+/-240 to match M5's true flattened/merged perpendicular "
-            "extent (480)."
-        ),
-        "old": "p111 = pya.Polygon([pya.Point(-208, -48), pya.Point(-208, 48), pya.Point(208, 48), pya.Point(208, -48)])",
-        "new": "p111 = pya.Polygon([pya.Point(-284, -48), pya.Point(-284, 48), pya.Point(284, 48), pya.Point(284, -48)])",
-    },
-    {
-        "rule": "V4.M5.AUX.2",
-        "old": "p112 = pya.Polygon([pya.Point(68, -48), pya.Point(68, 48), pya.Point(164, 48), pya.Point(164, -48)])",
-        "new": "p112 = pya.Polygon([pya.Point(-240, -48), pya.Point(-240, 48), pya.Point(240, 48), pya.Point(240, -48)])",
-    },
-    {
-        "rule": "V4.M5.AUX.2",
-        "old": "p113 = pya.Polygon([pya.Point(-164, -48), pya.Point(-164, 48), pya.Point(-68, 48), pya.Point(-68, -48)])",
-        "new": "p113 = pya.Polygon([pya.Point(-240, -48), pya.Point(-240, 48), pya.Point(240, 48), pya.Point(240, -48)])",
-    },
-    {
-        "rule": "V5.M6.AUX.2",
-        "description": (
-            "VIA_VIA56_2_2_66_58: grow 2 of the 4 V5 vias to span the full "
-            "Y=+/-320 to match M6's true flattened/merged perpendicular extent "
-            "(640). The other 2 (p118/p119) are left as-is - they become a "
-            "harmless subset of the now-larger p116/p117 at the same X range."
-        ),
-        "old": "p116 = pya.Polygon([pya.Point(68, 68), pya.Point(68, 196), pya.Point(164, 196), pya.Point(164, 68)])",
-        "new": "p116 = pya.Polygon([pya.Point(68, -320), pya.Point(68, 320), pya.Point(164, 320), pya.Point(164, -320)])",
-    },
-    {
-        "rule": "V5.M6.AUX.2",
-        "old": "p117 = pya.Polygon([pya.Point(-164, 68), pya.Point(-164, 196), pya.Point(-68, 196), pya.Point(-68, 68)])",
-        "new": "p117 = pya.Polygon([pya.Point(-164, -320), pya.Point(-164, 320), pya.Point(-68, 320), pya.Point(-68, -320)])",
-    },
-]
+}
+
+_POLY_INSERT_RE_TMPL = (
+    r"(?P<var>p\w+) = (?P<rhs>pya\.Polygon\(\[pya\.Point\((?P<x0>-?\d+), (?P<y0>-?\d+)\), "
+    r"pya\.Point\((?P<x1>-?\d+), (?P<y1>-?\d+)\), pya\.Point\((?P<x2>-?\d+), (?P<y2>-?\d+)\), "
+    r"pya\.Point\((?P<x3>-?\d+), (?P<y3>-?\d+)\)\]\))\r?\n"
+    r"cell_{cell}\.shapes\(layout\.layer\(pya\.LayerInfo\((?P<layer>\d+), 0\)\)\)\.insert\((?P=var)\)"
+)
 
 
 def apply_validated_fixes(script_text):
-    """Applies each validated fix only on an exact, unambiguous match.
+    """Applies each validated fix structurally, per CELL_FIX_SPECS.
+
+    For each target via cell: find every pXXX = pya.Polygon(...) statement
+    immediately followed by that exact cell's .insert(pXXX) call, group the
+    matches by GDS layer (in appearance order within each layer), and only
+    apply edits if the found layer/shape-count structure EXACTLY matches the
+    validated spec - any mismatch (missing layer, wrong shape count, extra
+    layer) skips that entire cell rather than guessing.
+
     Returns (patched_text, applied_list, skipped_list)."""
     applied = []
     skipped = []
-    for fix in VALIDATED_FIXES:
-        count = script_text.count(fix["old"])
-        if count == 1:
-            script_text = script_text.replace(fix["old"], fix["new"], 1)
-            applied.append(fix["rule"])
-        else:
-            skipped.append((fix["rule"], count))
+
+    for cell_name, layer_spec in CELL_FIX_SPECS.items():
+        pattern = re.compile(_POLY_INSERT_RE_TMPL.format(cell=re.escape(cell_name)))
+        matches = list(pattern.finditer(script_text))
+        if not matches:
+            skipped.append((cell_name, "cell not present in this case"))
+            continue
+
+        by_layer = defaultdict(list)
+        for m in matches:
+            by_layer[int(m.group("layer"))].append(m)
+
+        extra_layers = set(by_layer) - set(layer_spec)
+        structure_ok = not extra_layers
+        if structure_ok:
+            for layer, transforms in layer_spec.items():
+                if len(by_layer.get(layer, [])) != len(transforms):
+                    structure_ok = False
+                    break
+
+        if not structure_ok:
+            skipped.append((cell_name, f"structure mismatch: found layers={dict((l, len(v)) for l, v in by_layer.items())}"))
+            continue
+
+        # Build (start, end, replacement) edits, applied back-to-front so
+        # earlier offsets stay valid.
+        edits = []
+        for layer, transforms in layer_spec.items():
+            for match, transform in zip(by_layer[layer], transforms):
+                if transform is None:
+                    continue
+                coords = tuple(int(match.group(g)) for g in
+                                ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3"))
+                nx0, ny0, nx1, ny1, nx2, ny2, nx3, ny3 = transform(*coords)
+                var = match.group("var")
+                new_poly = (
+                    f"{var} = pya.Polygon([pya.Point({nx0}, {ny0}), "
+                    f"pya.Point({nx1}, {ny1}), pya.Point({nx2}, {ny2}), "
+                    f"pya.Point({nx3}, {ny3})])"
+                )
+                edits.append((match.start("var"), match.end("rhs"), new_poly))
+                applied.append(f"{cell_name}:layer{layer}:{var}")
+
+        for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+            script_text = script_text[:start] + replacement + script_text[end:]
+
     return script_text, applied, skipped
 
 
@@ -222,13 +285,13 @@ def main():
 
     original_script = layout_path.read_text(encoding="utf-8")
 
-    # Apply the pre-validated, exact-match-only geometric fixes.
+    # Apply the pre-validated, structurally-matched geometric fixes.
     patched_script, applied, skipped = apply_validated_fixes(original_script)
-    print(f"[INFO] Applied {len(applied)}/{len(VALIDATED_FIXES)} validated edits: {applied}",
+    print(f"[INFO] Applied {len(applied)} validated edit(s): {applied}",
           file=sys.stderr)
     if skipped:
-        print(f"[INFO] Skipped (exact text not found exactly once - likely a "
-              f"different case without this via cell): {skipped}", file=sys.stderr)
+        print(f"[INFO] Skipped (cell not present, or structure didn't match "
+              f"the validated pattern - safe no-op): {skipped}", file=sys.stderr)
 
     # Exercise the required model_endpoint interface: ask for a repair analysis
     # of what else looks fixable. Logged for the next iteration - its output

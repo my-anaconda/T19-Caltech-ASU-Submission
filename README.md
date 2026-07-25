@@ -6,29 +6,43 @@ Agent for the ASU block-repair benchmark (`ICLAD26-ASU-Problems`). See
 that follows this submission.
 
 **Current status: a real, KLayout-validated repair, beating every one of
-T19's 10 prior agent attempts.** `agent.py` applies 9 targeted, exact-match
-geometric fixes across 3 DRC rule families (`V2.M3.AUX.2`, `V4.M5.AUX.2`,
-`V5.M6.AUX.2`) - via/landing-pad shapes in standard ASAP7 PDK library cells
-that were locally sized correctly but didn't match the true *merged* extent
-of the metal region they sit inside once instantiated in the full design
-(confirmed via direct KLayout `pya.Region` flattened-hierarchy inspection,
-not guessing). Verified end-to-end through this exact `agent.py` against
-Block1, real KLayout 0.30.1, real evaluator:
+T19's 10 prior agent attempts, generalized across every available block
+(Block1/2/3/6/7), not just the one it was originally derived on.** `agent.py`
+applies targeted geometric fixes across 3 DRC rule families (`V2.M3.AUX.2`,
+`V4.M5.AUX.2`, `V5.M6.AUX.2`) - via/landing-pad shapes in standard ASAP7 PDK
+library cells that are locally sized correctly but don't match the true
+*merged* extent of the metal region they sit inside once instantiated in the
+full design (confirmed via direct KLayout `pya.Region` flattened-hierarchy
+inspection, not guessing). The fix engine matches *structurally* - by via-cell
+name, GDS layer, and occurrence-index within that layer - rather than by
+literal source text, because each block's script defines the same PDK cells
+with byte-identical local geometry but different auto-generated variable
+names (v1 of this agent matched on exact variable-name text and silently
+no-op'd on every block except the one it was written against - see NOTES.md).
 
-```
-repair_rate:            0.590   (was 0.0 for every one of T19's 10 prior attempts)
-final_violation_rate:   0.934   (was 1.29 at best prior/floor - first time below 1.0)
-connectivity_preserved: true (824/824 sources verified)
-eligible_for_scoring:   true
-```
+Verified end-to-end through this exact `agent.py`, real KLayout 0.30.1, real
+evaluator, against every available block, each compared to that block's own
+*true* pristine floor (a live KLayout re-run of the untouched script, not the
+naive `final_violation_rate = 1.0` assumption - see NOTES.md for why that
+assumption is wrong):
 
-`final_violation_rate < 1.0` means this repaired design genuinely has *fewer*
-violations than the unmodified original - not just fewer than prior broken
-agent attempts. See `NOTES.md` for the full investigation: why the naive
-floor isn't exactly `1.0` (a static-vs-live DRC discrepancy on 3 unrelated
-grid rules), the geometric root cause of the 3 fixed rule families, which
-similar-looking fixes were tried and failed (and why - a reused-cell-instance
-risk pattern that generalizes), and the concrete plan for the remaining rule
+| Case | Pristine floor | Repaired | Repair rate | Connectivity |
+|---|---:|---:|---:|---|
+| Block1 | 1.2910 | **0.9344** | 0.590 | 824/824 preserved |
+| Block2 | 1.3235 | **0.9706** | 0.588 | preserved |
+| Block3 | 1.2472 | **1.0000** | 0.506 | preserved |
+| Block6 | 1.2996 | **0.9231** | 0.656 | preserved |
+| Block7 | 1.2510 | **0.9203** | 0.584 | preserved |
+
+Every case: `valid_repair: true`, `connectivity_preserved: true`,
+`eligible_for_scoring: true`, and `final_violation_rate` genuinely below that
+block's own true pristine floor - not just below the prior 10-attempt
+history, and not just below the misleading naive-`1.0` baseline. See
+`NOTES.md` for the full investigation: why the naive floor isn't exactly
+`1.0`, the geometric root cause of the 3 fixed rule families, the
+variable-name generalization bug and its structural fix, which similar-
+looking fixes were tried and failed (and why - a reused-cell-instance risk
+pattern that generalizes), and the concrete plan for the remaining rule
 families (`V0.M1.AUX.3`, `V1.M1.EN.1`/`V1.M2.AUX.2`, spacing rules) left for
 future iterations.
 
@@ -106,7 +120,9 @@ cat factors/t19-final/block/repair/Block1_factors.json
 
 Expect `valid_repair: true`, `connectivity_preserved: true`,
 `final_violation_rate: 0.9344262295081968`, `repair_rate: 0.5901639344262295`
-- confirmed by direct local testing (KLayout 0.30.1 via WSL), reproduced
-end-to-end through this exact `agent.py` (run-id `t19-final-v1`). See
-`NOTES.md` for the full derivation of these fixes, why the naive floor isn't
-exactly `1.0`, and what's deferred to future iterations.
+for Block1 - confirmed by direct local testing (KLayout 0.30.1 via WSL),
+reproduced end-to-end through this exact `agent.py`. The same command with
+`--case Block2/Block3/Block6/Block7` reproduces the corresponding rows in the
+results table above. See `NOTES.md` for the full derivation of these fixes,
+why the naive floor isn't exactly `1.0`, and what's deferred to future
+iterations.
