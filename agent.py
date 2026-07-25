@@ -38,16 +38,28 @@ was written against - see NOTES.md's "Generalizing beyond Block1" section.
 Structural matching applies automatically wherever the expected
 {layer: shape-count} structure is found, and is inert (skipped, logged)
 wherever it isn't, degrading gracefully to the safe floor rather than
-guessing. Verified via real KLayout DRC re-run + connectivity check against
-all 5 available blocks (Block1/2/3/6/7), each beating its own true pristine
-floor. A DIFFERENT via cell family (VIA_VIA12, used far more ubiquitously
+guessing. A DIFFERENT via cell family (VIA_VIA12, used far more ubiquitously
 throughout the design for base M1<->M2 vias) was attempted with the same
 technique and made things dramatically worse instead (see NOTES.md) - a
 reminder that "the same family of fix" is not automatically safe to
 generalize, which is why it is NOT included here.
 
+A second, independent fix (apply_grid_alignment_fixes) targets M4.AUX.1
+(M4 grid-alignment): VIA_VIA45_1_2_58_58 (M4<->M5 via) and
+VIA_VIA34_1_2_58_52 (M3<->M4 via) are always co-located at the identical
+placement vector, so their M4 pads merge into one shape. Shifting only one
+of the pair breaks 4 OTHER rules (confirmed via real KLayout re-run, not
+assumed) - they must move together. Even shifted together, only rows that
+also land on a legal M4.AUX.2 "track" position (a sparser grid than the raw
+24nm one M4.AUX.1 checks) are safe; unsafe rows and two other off-grid
+residue classes (12/18, which broke other rules when tested) are left
+untouched and logged - see NOTES.md's "M4 grid alignment" section.
+
+Verified via real KLayout DRC re-run + connectivity check against all 5
+available blocks (Block1/2/3/6/7), each beating its own true pristine floor.
+
 Run via the benchmark runner:
-  python3 scripts/run_block_benchmark.py --case Block1 --agent-path agent.py --run-id t19-v2
+  python3 scripts/run_block_benchmark.py --case Block1 --agent-path agent.py --run-id t19-v3
 """
 
 import argparse
@@ -204,6 +216,99 @@ def apply_validated_fixes(script_text):
     return script_text, applied, skipped
 
 
+# ---------------------------------------------------------------------------
+# M4.AUX.1 grid-alignment fix (the "deferred" rule family from NOTES.md).
+#
+# VIA_VIA45_1_2_58_58 (M4<->M5 via) and VIA_VIA34_1_2_58_52 (M3<->M4 via) are
+# always placed at the exact same (X, Y) instance-placement vector, so their
+# M4 pads fully overlap into one merged shape. That pad's local geometry
+# (established from VIA_VIA45's p111, unaffected by the width-only fix
+# above) has its bottom edge 12nm below the placement Y - so whether the
+# merged pad lands on the 24nm M4 grid depends purely on the placement Y,
+# not on anything specific to Block1. Confirmed via real KLayout DRC re-run:
+# shifting ONLY one of the pair breaks 4 other rules (M4.AUX.2/3, M4.S.4,
+# V3.M4.AUX.2) - the pads must move together. Shifting both together by the
+# minimal +nm needed to reach the next 24nm grid line fixes M4.AUX.1 cleanly
+# for SOME rows, but not all: M4.AUX.2 requires landing on a sparser
+# "legal track" grid (period 192nm, phases 48/96), which not every 24nm-grid
+# point satisfies. Both facts were verified empirically (not assumed) across
+# every available block - see NOTES.md.
+# ---------------------------------------------------------------------------
+
+_M4_PAD_LOCAL_BOTTOM_NM = -48 * 0.25  # VIA_VIA45's p111, local Y bottom edge
+_M4_GRID_NM = 24
+_M4_TRACK_PERIOD_NM = 192
+_M4_TRACK_LEGAL_PHASES = (48, 96)
+
+_PAIR_INST_RE_TMPL = (
+    r"cell_(?P<topcell>\w+)\.insert\(pya\.CellInstArray\(cell_{cell}\.cell_index\(\), "
+    r"pya\.Trans\(0, False, pya\.Vector\((?P<x>-?\d+), (?P<y>-?\d+)\)\)\)\)"
+)
+
+
+def _find_instances(script_text, cell_name):
+    pattern = re.compile(_PAIR_INST_RE_TMPL.format(cell=re.escape(cell_name)))
+    return {(m.group("topcell"), int(m.group("x")), int(m.group("y"))): m
+            for m in pattern.finditer(script_text)}
+
+
+def apply_grid_alignment_fixes(script_text):
+    """Shifts co-located VIA_VIA45/VIA_VIA34 instance pairs that are off the
+    M4 grid onto it, but only where doing so is confirmed safe (lands on a
+    legal M4.AUX.2 track too, per _M4_TRACK_LEGAL_PHASES) - otherwise skips
+    and logs, exactly like apply_validated_fixes(). Returns
+    (patched_text, applied_list, skipped_list)."""
+    via45 = _find_instances(script_text, "VIA_VIA45_1_2_58_58")
+    via34 = _find_instances(script_text, "VIA_VIA34_1_2_58_52")
+
+    applied = []
+    skipped = []
+    edits = []  # (start, end, replacement)
+
+    for (topcell, x, y), m45 in via45.items():
+        key34 = (topcell, x, y)
+        if key34 not in via34:
+            skipped.append((f"VIA_VIA45@({x},{y})", "no co-located VIA_VIA34 pair"))
+            continue
+        m34 = via34[key34]
+
+        abs_bottom = y * 0.25 + _M4_PAD_LOCAL_BOTTOM_NM
+        residue = round(abs_bottom) % _M4_GRID_NM
+        if residue == 0:
+            continue  # already on-grid, nothing to do
+
+        # Only residue=6 rows are handled here: real KLayout re-runs confirmed
+        # the "shift both instances up to the next grid line" fix is safe for
+        # SOME residue=6 rows (gated by _M4_TRACK_LEGAL_PHASES below) and
+        # confirmed it breaks other rules (M4.AUX.2/3, M4.S.4, V3.M4.AUX.2)
+        # on the residue=12/18 rows tested so far - those appear to need a
+        # different fix, not yet derived. See NOTES.md.
+        if residue != 6:
+            skipped.append((f"VIA_VIA45+VIA_VIA34@({x},{y})",
+                             f"residue={residue} - not yet validated, deferred"))
+            continue
+
+        shift_nm = _M4_GRID_NM - residue  # minimal move up to the next grid line
+        candidate_abs = abs_bottom + shift_nm
+        legal = round(candidate_abs) % _M4_TRACK_PERIOD_NM in _M4_TRACK_LEGAL_PHASES
+        if not legal:
+            skipped.append((f"VIA_VIA45+VIA_VIA34@({x},{y})",
+                             f"residue={residue}, no confirmed-safe shift (would land off the legal M4 track)"))
+            continue
+
+        new_y = y + int(round(shift_nm / 0.25))
+        for m in (m45, m34):
+            old_line = m.group(0)
+            new_line = old_line.replace(f"Vector({x}, {y})", f"Vector({x}, {new_y})")
+            edits.append((m.start(), m.end(), new_line))
+        applied.append(f"VIA_VIA45+VIA_VIA34@({x},{y})->y={new_y}")
+
+    for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+        script_text = script_text[:start] + replacement + script_text[end:]
+
+    return script_text, applied, skipped
+
+
 def parse_error_payload(error_text):
     try:
         payload = json.loads(error_text)
@@ -292,6 +397,15 @@ def main():
     if skipped:
         print(f"[INFO] Skipped (cell not present, or structure didn't match "
               f"the validated pattern - safe no-op): {skipped}", file=sys.stderr)
+
+    # Apply the M4 grid-alignment fixes (co-located via-pair instance shifts).
+    patched_script, grid_applied, grid_skipped = apply_grid_alignment_fixes(patched_script)
+    print(f"[INFO] Applied {len(grid_applied)} grid-alignment edit(s): {grid_applied}",
+          file=sys.stderr)
+    if grid_skipped:
+        print(f"[INFO] Skipped grid-alignment (no confirmed-safe shift for this "
+              f"pair/row - safe no-op): {grid_skipped}", file=sys.stderr)
+    applied = applied + grid_applied
 
     # Exercise the required model_endpoint interface: ask for a repair analysis
     # of what else looks fixable. Logged for the next iteration - its output

@@ -196,6 +196,89 @@ Regression-checked: the new structural engine's output on Block1 is
 byte-for-byte identical to the original v1 hardcoded-string output, so
 nothing was lost in the rewrite.
 
+## M4 grid alignment (v3) - the first deferred rule family tackled
+
+`M4.AUX.1`/`M5.AUX.1`/`M6.AUX.1` (M4/M5/M6 must land on a 24/24/32nm grid,
+checked on the *merged* metal region) were flagged above as the single
+largest remaining violation bucket - and initially looked unfixable. This
+section records both the failed attempt and the fix that followed it,
+because the failure is what made the real fix findable.
+
+**First attempt: shift one off-grid via pad. Failed badly.** Investigated
+visually in the KLayout GUI (loading the pristine GDS with `-m` to overlay
+DRC markers) plus direct `pya.RecursiveShapeIterator` queries to trace a
+specific `M4.AUX.1` violation back to its source shape: the M4 landing pad
+inside `VIA_VIA45_1_2_58_58` (already touched by the width-only fix above).
+Shifting *only* that one instance's placement Y by -6nm (to the nearest
+24nm grid line) did clear the grid violation, but broke **4 other rules**
+at the same spot: `M4.AUX.2` (+2, track-position alignment), `M4.AUX.3`
+(+4, "M4 may not bend"), `M4.S.4` (+2, spacing), `V3.M4.AUX.2` (+2, the pad
+no longer matches the via *below* it). Net: +8 violations, not -2 - real
+KLayout re-run, not assumed.
+
+**Root cause, found via direct `pya` shape queries plus GUI inspection:**
+`VIA_VIA45_1_2_58_58` (M4↔M5 via) and `VIA_VIA34_1_2_58_52` (M3↔M4 via) are
+always placed at the **exact same instance-placement vector**, so their M4
+pads fully overlap into a single merged shape - confirmed by grepping both
+cells' placement lines in `Block1.py` and finding identical
+`pya.Vector(X, Y)` arguments. The failed attempt moved only one of the two,
+desyncing a merge that's supposed to stay coincident - that's the "bend"
+and the other 3 new violations. GUI screenshots of the resulting layout
+showed the mismatch directly: a thin orphaned sliver where the two pads no
+longer lined up.
+
+**The real fix: shift both co-located instances together.** Re-tested the
+same -6nm shift, applied to *both* instances at once: `M4.AUX.1` -4,
+zero collateral (no `M4.AUX.2`/`M4.AUX.3`/`M4.S.4`/`V3.M4.AUX.2`), real
+KLayout confirmed. Testing the opposite direction (+18nm, up to the *next*
+grid line, instead of -6nm down to the previous one) was even better:
+`M4.AUX.1` -4 with zero collateral **and** no `M4.AUX.2` either - direction
+matters, because `M4.AUX.2`'s legal M4 track positions are a *sparser* grid
+than the raw 24nm one `M4.AUX.1` checks (confirmed empirically: the working
+shift lands at `abs_Y mod 192 = 96`; failing ones don't hit that pattern).
+
+**Scaling up surfaced a second, row-dependent gate.** Block1 has 24
+co-located `VIA_VIA45`/`VIA_VIA34` pairs, in 4 groups of 6 by grid residue
+(0 = already on-grid, 6/12/18 = off-grid). Applying the validated "+18nm,
+both instances together" fix to all 6 residue=6 pairs at once produced a
+surprise: net still improved, but `M4.AUX.2` reappeared (+2) - meaning not
+every residue=6 *row* is safe, only some. Bisecting confirmed it precisely:
+of the 3 distinct row Y-positions among Block1's 6 residue=6 pairs
+(Y=11880, Y=7560, Y=3240), the two rows at Y=11880/Y=3240 are clean and the
+row at Y=7560 is not - a **row-level** property (same result at both X
+columns for each row), consistent with `M4.AUX.2`'s legal-track period
+(192nm) not evenly dividing the ~1080nm row-to-row spacing used here.
+Applying the fix only to the confirmed-clean 4 pairs: `M4.AUX.1` -16,
+zero collateral, real KLayout confirmed.
+
+**Generalized into `agent.py` as a safety-gated, block-agnostic rule**
+(`apply_grid_alignment_fixes`): find every co-located `VIA_VIA45`/`VIA_VIA34`
+pair (matched by identical placement vector, regardless of which block's
+top-cell name it's under), compute the pad's grid residue, and - **only for
+residue=6** - compute the minimal up-shift to the next grid line and check
+it lands on a legal `M4.AUX.2` track (`abs_Y mod 192 ∈ {48, 96}`) before
+applying it to both instances together. Residue=12/18 are deliberately
+**not** attempted: individually testing one instance from each (with the
+same "shift both instances, round up to next grid line" logic) still
+produced `M4.AUX.2`/`M4.AUX.3`-style collateral, meaning residue=12/18 need
+either a different target shift or a genuinely different fix - not yet
+derived, and not guessed at here. Verified via real KLayout DRC + connectivity
+re-run across all 5 blocks:
+
+| Case | Pristine floor | v2 (via-growth only) | v3 (+ M4 grid alignment) | Connectivity |
+|---|---:|---:|---:|---|
+| Block1 | 1.2910 | 0.9344 | **0.8852** | preserved |
+| Block2 | 1.3235 | 0.9706 | **0.9265** | preserved |
+| Block3 | 1.2472 | 1.0000 | **0.9663** | preserved |
+| Block6 | 1.2996 | 0.9231 | **0.8745** | preserved |
+| Block7 | 1.2510 | 0.9203 | **0.8967** | preserved |
+
+Every case still `valid_repair: true`, `connectivity_preserved: true`. The
+`M4.AUX.2` legal-track period (192nm, phases 48/96) was derived from just 2
+data points on Block1 and cross-checked against every distinct residue=6 row
+Y-value across all 5 blocks (6 distinct rows total) before being trusted as
+a general gate - not just fit to Block1 and hoped to generalize.
+
 ## Fixes that didn't work (and why - important for future iterations)
 
 - **Naive V2 height fix (56, the isolated-cell height) instead of 68 (the
@@ -220,6 +303,23 @@ nothing was lost in the rewrite.
 
 ## What's still open (deferred to future iterations per plan)
 
+- `M4.AUX.1` residue=12/18 rows (12 more co-located pairs in Block1 alone):
+  the "shift both instances up to the next grid line" logic that works
+  cleanly for residue=6 does not transfer as-is - individually testing one
+  residue=12 and one residue=18 instance (same both-together shift
+  discipline) still produced `M4.AUX.2`-style collateral. Possibly a
+  different legal-track phase for these residues, or a genuinely different
+  geometry constraint - not yet derived. Next step planned: either derive
+  `M4.AUX.2`'s exact legal-track formula from the `.lydrc` rule deck's
+  `offgrid_cl(:y, 192, 48, 96)` call directly (rather than the current
+  reverse-engineered mod-192/{48,96} approximation, which was cross-checked
+  against 6 data points but not derived from the rule's actual semantics),
+  or brute-force search nearby candidate shifts per row via real KLayout
+  DRC re-run.
+- `M5.AUX.1`/`M6.AUX.1`: not yet investigated at all - may share the same
+  co-located-pair mechanism as `M4.AUX.1` (both via cells also carry M5/M6
+  shapes - see `VIA_VIA45_1_2_58_58`'s `p110` and `VIA_VIA56_2_2_66_58`'s
+  `p114`/`p115`), or may need their own investigation.
 - `V0.M1.AUX.3` (37 violations): spread across multiple different standard
   logic cells (`BUFx2`, `INVx2`, `INVx3`, `BUFx3`, `FAx1`, `BUFx6f`) - likely
   as reuse-sensitive as `VIA_VIA12` above; needs per-cell-family

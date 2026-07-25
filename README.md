@@ -20,6 +20,20 @@ with byte-identical local geometry but different auto-generated variable
 names (v1 of this agent matched on exact variable-name text and silently
 no-op'd on every block except the one it was written against - see NOTES.md).
 
+On top of that, `agent.py` also fixes a subset of `M4.AUX.1` (M4 grid-alignment)
+violations: `VIA_VIA45_1_2_58_58` (M4↔M5 via) and `VIA_VIA34_1_2_58_52`
+(M3↔M4 via) are always co-located at the identical placement vector so their
+M4 pads merge into one shape; shifting *both* instances together onto the
+next 24nm grid line fixes the grid violation, but only for rows that also
+land on a legal `M4.AUX.2` track position (period 192nm, phases 48/96nm from
+origin) - confirmed by real KLayout re-run per row, not assumed. Rows that
+don't land on a legal track, and two other off-grid residue classes
+(`residue=12`/`18`, which real testing showed break 4 *other* rules when
+naively rounded to the nearest grid line) are deliberately left untouched
+and logged as skipped - see NOTES.md's "M4 grid alignment" section for the
+full derivation, including the one shift that DID look clean until scaled up
+across all matching rows and turned out not to be.
+
 Verified end-to-end through this exact `agent.py`, real KLayout 0.30.1, real
 evaluator, against every available block, each compared to that block's own
 *true* pristine floor (a live KLayout re-run of the untouched script, not the
@@ -28,23 +42,25 @@ assumption is wrong):
 
 | Case | Pristine floor | Repaired | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.9344** | 0.590 | 824/824 preserved |
-| Block2 | 1.3235 | **0.9706** | 0.588 | preserved |
-| Block3 | 1.2472 | **1.0000** | 0.506 | preserved |
-| Block6 | 1.2996 | **0.9231** | 0.656 | preserved |
-| Block7 | 1.2510 | **0.9203** | 0.584 | preserved |
+| Block1 | 1.2910 | **0.8852** | 0.574 | preserved |
+| Block2 | 1.3235 | **0.9265** | 0.574 | preserved |
+| Block3 | 1.2472 | **0.9663** | 0.494 | preserved |
+| Block6 | 1.2996 | **0.8745** | 0.640 | preserved |
+| Block7 | 1.2510 | **0.8967** | 0.577 | preserved |
 
-Every case: `valid_repair: true`, `connectivity_preserved: true`,
-`eligible_for_scoring: true`, and `final_violation_rate` genuinely below that
-block's own true pristine floor - not just below the prior 10-attempt
-history, and not just below the misleading naive-`1.0` baseline. See
-`NOTES.md` for the full investigation: why the naive floor isn't exactly
-`1.0`, the geometric root cause of the 3 fixed rule families, the
-variable-name generalization bug and its structural fix, which similar-
-looking fixes were tried and failed (and why - a reused-cell-instance risk
-pattern that generalizes), and the concrete plan for the remaining rule
-families (`V0.M1.AUX.3`, `V1.M1.EN.1`/`V1.M2.AUX.2`, spacing rules) left for
-future iterations.
+Every case: `valid_repair: true`, `connectivity_preserved: true`, and
+`final_violation_rate` genuinely below that block's own true pristine floor -
+not just below the prior 10-attempt history, and not just below the
+misleading naive-`1.0` baseline. See `NOTES.md` for the full investigation:
+why the naive floor isn't exactly `1.0`, the geometric root cause of the 3
+via-enclosure rule families, the variable-name generalization bug and its
+structural fix, the M4 grid-alignment derivation (including a shift that
+looked clean in isolation but broke 4 other rules once tried without moving
+its paired via cell too), which similar-looking fixes were tried and failed
+(and why - a reused-cell-instance risk pattern that generalizes), and the
+concrete plan for the remaining rule
+families (`V0.M1.AUX.3`, `V1.M1.EN.1`/`V1.M2.AUX.2`, spacing rules, and the
+`M4.AUX.1` residue=12/18 rows) left for future iterations.
 
 ## Layout
 
@@ -119,7 +135,7 @@ cat factors/t19-final/block/repair/Block1_factors.json
 ```
 
 Expect `valid_repair: true`, `connectivity_preserved: true`,
-`final_violation_rate: 0.9344262295081968`, `repair_rate: 0.5901639344262295`
+`final_violation_rate: 0.8852459016393442`, `repair_rate: 0.5737704918032787`
 for Block1 - confirmed by direct local testing (KLayout 0.30.1 via WSL),
 reproduced end-to-end through this exact `agent.py`. The same command with
 `--case Block2/Block3/Block6/Block7` reproduces the corresponding rows in the
