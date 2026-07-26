@@ -746,15 +746,32 @@ else.
   shape can simultaneously (a) fully cover the via and (b) avoid erasing
   the notch edge V0.M1.AUX.3 depends on.
 
-  **Conclusion**: confirmed dead end for this instance via direct proof,
-  not just repeated failed attempts. The same boolean-coverage check could
-  be run per-instance to confirm (or, in principle, occasionally refute)
-  this for the other 36, but the underlying mechanism - the same `VIA_VIA12`
-  cell's same internal geometry landing on the same kind of standard-cell
-  notch - makes it likely structural across most/all of them. Building a
-  general per-instance shape-solver only makes sense for instances where
-  this coverage check comes back non-empty (i.e. where slack genuinely
-  exists) - worth checking BEFORE building solver tooling, not after.
+  **Extended the same boolean check across all 37 violations, not just
+  this one instance** (per-marker: find the nearby `VIA_VIA12`'s V1
+  footprint, determine which of V0's edges is coincident vs. not to locate
+  the notch line, compute the via's forced-coverage zone on the
+  non-coincident side, check true polygon coverage by anything other than
+  `VIA_VIA12`'s own pad):
+
+  | Result | Count |
+  |---|---:|
+  | Provably infeasible (zero coverage from anything else) | 35 |
+  | Has genuine slack (some other material already covers the zone) | 0 |
+  | Ambiguous (different local structure, not the same simple pattern) | 2 |
+
+  **Conclusion**: this is not one hard instance - it's essentially the
+  whole bucket. 35 of 37 (95%) are provably geometrically infeasible by
+  the identical mechanism, with zero found to have exploitable slack for a
+  pad-reshaping fix. A per-instance shape-solver would have nothing to
+  solve for the 35 - the answer for each is already proven "no legal pad
+  shape exists, full stop," not "not yet found." The remaining 2 ambiguous
+  cases are the only theoretically open thread, and would need their own
+  individual investigation (different local geometry the simple top/bottom
+  coincidence check didn't cleanly categorize) - a small enough number that
+  it's not worth building general solver tooling for. `V0.M1.AUX.3` is now
+  closed out for this session: mechanism fully understood, fix directions
+  exhaustively tested, and the negative result is proven rather than
+  assumed.
 - `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
