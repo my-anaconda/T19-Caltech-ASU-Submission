@@ -1041,13 +1041,99 @@ shape-merge issues this repo's current geometric patches target** - genuine
 standard-cell-level physical overlaps, not sub-cell notch/coverage issues.
 The two approaches look complementary rather than overlapping in scope.
 
-### Still not done: steps 4-5 (patch KLayout script + re-routing)
+### Step 4 done: diffing + patching the KLayout script (2026-07-26)
 
-Have not yet: diffed legalized vs. original positions to build a per-
-instance delta list, applied those deltas to `Block1.py`'s own
-`pya.CellInstArray(...)` calls (keeping it a runnable KLayout script per
-`AGENT_GUIDE.md`), or touched routing at all. Every moved cell's local
-wires/vias will need re-stitching - still the hardest, unstarted part.
-Scratch scripts from this session (`extract_instances.py`, `gen_def.py`,
-the orientation-resolution scripts) are throwaway prototypes, not yet
-integrated into `agent.py`.
+**Extraction method changed - important correctness fix.** The step-1/2/3
+prototype above extracted instances by executing `Block1.py` in KLayout and
+walking `top.each_inst()`. Cross-checking that order against a second,
+independent extraction (regexing `Block1.py`'s own source text for each
+`cell_Block1.insert(pya.CellInstArray(...))` call, in file order) found
+**129 of 143 instances in a different order** between the two methods -
+`each_inst()`'s iteration order does not reliably follow insertion/source
+order. This matters a lot here: patching the script back requires mapping
+"the i-th legalized instance" to an exact source location, which is only
+possible with the regex-based, source-order extraction. Re-ran the whole
+DEF-generation + `detailed_placement` pipeline against the regex-ordered
+list (same 143 cells, same die geometry, same class of result: 44
+violations converged to 0 in 3 iterations this time, total displacement
+28.5um / avg 0.2um / max 1.6um - consistent with the first run modulo
+negotiation-order-dependent details).
+
+**Patch mechanism**: the regex extraction captures each match's exact
+string span (including the `Vector(X, Y)` sub-groups' character offsets),
+so patching is a precise, minimal string replacement - only the two
+integers inside each moved instance's `Vector(...)` call are rewritten
+(processed in reverse text order so earlier edits don't shift later
+offsets), leaving 100% of the rest of the 3764-line script byte-identical.
+56 of 143 instances moved (mostly clean single-row shifts, i.e. exactly
++/-1080 KLayout units = +/-270 DEF units = +/-1 row height in Y with X
+unchanged; a few larger, up to 5 rows, still within the 2um displacement
+cap). The patched script (`Block1_legalized.py`) parses as valid Python and
+runs cleanly through `klayout -b -r` (produces a GDS with no errors).
+
+### Step 5 (re-routing): confirmed mandatory, not yet attempted - real numbers
+
+Ran the patched, **placement-only** (no re-routing) script through the real
+evaluator (`evaluator/evaluate_repair.py`) to see where things stand before
+building any re-stitching logic. Result is unambiguous:
+
+- `connectivity_preserved: false` - 460 missing connectivity sources, 171
+  pin-endpoint mismatches, 69 routing-endpoint-count mismatches (out of 824
+  connectivity sources checked).
+- `original_violations: 244` -> **`final_violations: 1650`** (1406 *new*
+  violations introduced, `repair_rate: 0.0`).
+- `eligible_for_scoring: false`, `score_exclusion_reason:
+  connectivity_not_preserved` - this would be disqualified outright under
+  the benchmark's gated scoring policy, not merely scored poorly.
+
+**Conclusion: moving cells without re-stitching the wires/vias that
+connected to their old pin locations does not just leave the design
+partially unfixed - it actively destroys it.** Re-routing is a hard
+prerequisite for this technique to produce any net benefit, not an
+optional refinement. This is real, evaluator-verified data, not a
+prediction - worth treating as settled going into whatever attempts
+re-routing next.
+
+### Re-routing: not attempted this session - options considered, deliberately left open
+
+Two candidate approaches were discussed and neither has been started:
+
+1. **Cheap/partial**: for each moved cell, identify the short wire/via
+   shapes that connect *exclusively* to that cell's own pins (by
+   proximity to the pin location) and translate just those shapes by the
+   same delta as the cell - skipping any wire that also touches a
+   stationary cell (which would need real re-routing, not just
+   translation). Most of the 56 moves are clean, uniform single-axis
+   shifts, which is favorable for this approach, but it will not fix
+   violations on shared inter-cell wires, and "which shapes belong
+   exclusively to which cell's pins" isn't captured by anything built so
+   far - would need to be derived from the per-block `connectivity/*.json`
+   reference and/or proximity heuristics against the DRC evaluator's own
+   `missing_connectivity_source_details`/`routing_endpoint_count_mismatch_details`
+   (both already show exactly which polygons broke, by position - useful
+   ground truth for building and checking this against).
+2. **Full**: translate the whole design including routing layers into
+   LEF/DEF and run OpenROAD's global+detailed router
+   (`global_route`/`detailed_route`) to recompute affected routing
+   properly, then translate the routed DEF's wire/via geometry back into
+   the KLayout script format. More correct, substantially more effort -
+   net extraction, matching this PDK's exact via-stack conventions, and a
+   DEF-routing-to-KLayout-polygon translator all still need to be built
+   from scratch.
+
+Neither was attempted - stopping here per instruction, to keep this
+session's work fully verified rather than leaving partially-built,
+unverified re-routing code behind.
+
+### Artifacts from this session (all throwaway prototypes, not integrated into `agent.py`)
+
+`extract_instances.py`/`extract_instances2.py` (pya-execution vs.
+regex-based extraction - use the regex one), `resolve_orient.py`/
+`check_orient*.py`/`check_trans*.py` (orientation mapping verification),
+`gen_def.py` (DEF generator), `run_legalize.tcl` (loads LEF+DEF, runs
+`detailed_placement`, writes the legalized DEF), `diff_and_patch.py` (diffs
+legalized vs. original positions, patches `Block1.py`). None of this lives
+in the actual submission yet (`agent.py` is unchanged) - it's all been run
+from a scratch WSL directory (`~/asu_eval`) against a copy of `Block1.py`,
+proving the pipeline works end-to-end through step 4 before any of it gets
+wired into the real agent.
