@@ -470,6 +470,17 @@ def compute_grid_shifts(instances):
         # not y % _M4_GRID_RAW == 0.
         residue = (y - _M4_TRACK_OFFSET_RAW) % _M4_GRID_RAW
         if residue == 0:
+            # NOTE: rows already on the 24nm grid but off the coarser 192nm
+            # track (M4.AUX.2) are a real, confirmed gap (20 instances across
+            # all 7 blocks) - but a real KLayout re-run of a candidate fix
+            # (shift by a full 96 raw / one grid step, checked only for M4
+            # spacing safety) broke connectivity on 2 of 7 blocks (26 pin +
+            # 7 routing endpoint mismatches on Block1 alone). A 96-unit shift
+            # is much larger than the typical off-grid correction below and
+            # likely needs its own M3/M2/M1 cascade re-validation, the same
+            # way the original off-grid fix did - not yet built. Left
+            # unfixed rather than shipping something that broke connectivity
+            # when actually tested. See NOTES.md.
             continue  # already on the M4.AUX.1 grid, nothing to do here
 
         up = y + (_M4_GRID_RAW - residue)

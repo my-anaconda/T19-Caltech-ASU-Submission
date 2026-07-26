@@ -798,6 +798,28 @@ else.
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
   pre-existing violation on vias this fix doesn't touch), and remains open.
+- `M4.AUX.2` (2 remaining in Block1, 20 total across all 7 blocks):
+  root-caused precisely - these are `VIA_VIA45`/`VIA_VIA34` co-located pairs
+  already on the base 24nm grid (`M4.AUX.1` satisfied, residue 0) but not on
+  the coarser 192nm track the original grid-alignment logic never even
+  checked for in that case (it only ever looked at off-grid rows). Attempted
+  a fix (shift by one full 24nm grid step, 96 raw units - both directions
+  are guaranteed track-legal here since 192=2x96, so a real M4-spacing
+  safety check picks between them) and validated it via a real
+  `evaluate_repair.py` + `check_connectivity.py` re-run across all 7 blocks,
+  not just DRC: **broke connectivity on 2 of 7 blocks** (26 pin + 7 routing
+  endpoint mismatches on Block1 alone), even though the M4 spacing check
+  itself passed cleanly. Reverted rather than shipped (confirmed via
+  `git diff` against the last shipped commit that the revert is clean - only
+  a documentation comment remains, no functional change). Root cause is
+  almost certainly the same class of issue as the very first grid-alignment
+  attempt: a 96-raw shift is much larger than the typical off-grid
+  correction and likely changes M3's merge topology under `VIA_VIA34`,
+  needing the same kind of M3/M2/M1 cascade re-validation
+  `apply_dynamic_v2m3_fix`/`apply_dynamic_v1m2_fix` already do for the
+  off-grid case - just not yet extended to cover this one too. A real,
+  understood, and bounded next step (20 instances, known mechanism) for
+  whoever picks this up, but not shipped without that cascade handling.
 - Spacing rules (`M1.S.2`, `M1.S.4`, `M2.S.7`, `M3.S.2`, `M4.S.5`) and 2 small
   new spacing violations introduced as a side effect of the M4/M5 fix
   (`M4.S.2`/`M4.S.3`, accepted as a net-positive tradeoff given the overall
