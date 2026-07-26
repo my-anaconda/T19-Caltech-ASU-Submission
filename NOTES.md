@@ -597,15 +597,105 @@ else.
   against 6 data points but not derived from the rule's actual semantics),
   or brute-force search nearby candidate shifts per row via real KLayout
   DRC re-run.
-- `M5.AUX.1`/`M6.AUX.1`: not yet investigated at all - may share the same
-  co-located-pair mechanism as `M4.AUX.1` (both via cells also carry M5/M6
-  shapes - see `VIA_VIA45_1_2_58_58`'s `p110` and `VIA_VIA56_2_2_66_58`'s
-  `p114`/`p115`), or may need their own investigation.
-- `V0.M1.AUX.3` (37 violations): spread across multiple different standard
-  logic cells (`BUFx2`, `INVx2`, `INVx3`, `BUFx3`, `FAx1`, `BUFx6f`) - likely
-  as reuse-sensitive as `VIA_VIA12` above; needs per-cell-family
-  instance-count and per-instance-context checking before attempting.
-  Deferred, not attempted.
+- `M5.AUX.1`/`M6.AUX.1`: investigated and found NOT tractable the same way as
+  `M4.AUX.1`. `VIA_VIA45_1_2_58_58`'s own local M5 pad (`p110`, 480x184) and
+  `VIA_VIA56_2_2_66_58`'s own local M5/M6 pads (`p114`/`p115`) are NOT what
+  dominates the grid-alignment check - confirmed via direct `pya` probing:
+  a genuine, separate top-level `Block1` shape spans Y=2068-13680 (11612
+  raw units - nearly the full block height) on M5, and another spans
+  X=1888-13168 (11280 raw units - nearly the full row width) on M6. These
+  are real power/signal rails, not owned by any via cell; the via cells'
+  own pads are tiny taps into them. Shifting the via cell's placement (the
+  M4.AUX.1 trick) wouldn't move the rail - it would just disconnect the via
+  from it. Fixing this for real means relocating the rail itself, which
+  likely serves many other taps along its entire height/width - the same
+  "high-reuse, high-blast-radius" danger class as `VIA_VIA12`, not a small
+  contained move. Not pursued further.
+- `V1.M1.EN.1` (11 violations): investigated - every violation traced via
+  direct `pya` probing lands on `VIA_VIA12` specifically (the base M1<->M2
+  via, 150 instances in Block1 alone - the same cell explicitly flagged as
+  catastrophic to touch blind in "Fixes that didn't work" above). Not
+  pursued further for the same reason.
+- `V0.M1.AUX.3` (37 violations): investigated exhaustively - four genuinely
+  different fix directions tried, each disproven with real measurements
+  (not assumptions). Root cause fully understood; no safe fix found.
+
+  **Confirmed context-dependent, not a library defect**: `BUFx2_ASAP7_75t_R`
+  checked via the real DRC deck in total isolation (its own shapes copied
+  into a standalone top cell - the first attempt at this silently produced
+  an EMPTY GDS due to a `Shapes.insert()` misuse, giving a false "0
+  violations" read; rebuilt correctly per-shape, confirmed non-empty: 5 M1
+  shapes, 15 V0 shapes copied) genuinely gives **zero** `V0.M1.AUX.3`
+  violations - confirmed a second, independent way by replicating the
+  rule's exact edge logic directly in `pya` (`v0.edges - m1.edges`, split by
+  angle, checking corner interaction) against both the isolated cell and
+  the full Block1 layout: 0 flagged in isolation, 37 in Block1, matching the
+  real DRC tool exactly.
+
+  **Root cause, nailed down to the single erased edge**: for one flagged
+  instance (`BUFx2` at (5832,2160)), V0 sits at abs `(6444,2268)-(6516,2340)`.
+  Its own cell's internal M1 shape (`p490`, an 8-point NOTCHED polygon, not
+  a rectangle) has a deliberate step at local Y=180 that - in isolation -
+  keeps this V0's top edge exactly coincident with that step, satisfying
+  the rule by design. Edge-by-edge comparison (`pya.Edges`, exact overlap
+  check) showed this same top edge is coincident in isolation but NOT in
+  the full Block1 layout. Diffing the true merged M1 region (real polygons,
+  not bounding boxes) between the two contexts isolated the exact culprit:
+  a single extra shape, abs bbox `(6480,2340)-(6552,2384)`, present only in
+  Block1 - which is `VIA_VIA12`'s own M1 pad. Checked across 15 sampled
+  violations: **100% of them have a `VIA_VIA12` instance sitting right
+  there** - not a coincidence, a universal mechanism. `VIA_VIA12` (the
+  router's base M1<->M2 via, connecting a standard cell's internal pin up
+  to the routing fabric) drops its pad exactly on top of the library cell's
+  purpose-built notch, erasing the one edge that kept V0 DRC-clean.
+
+  **Four fix directions tried, all disproven with real data:**
+  1. *Grow V0 to match the merged M1* - blocked by diffusion (LISD) size:
+     measured across 12 sampled instances, LISD is a fixed ~96 raw units
+     wide while the merged M1 needing to be matched is 200-848 (2.1x-8.8x
+     too big) - growing V0 that much would blow through `V0.LISD.EN.2`/
+     `V0.LISD.EN.3`, rules already in the DRC deck, no LVS needed to see
+     this is geometrically impossible in every case checked.
+  2. *Add a redundant M1 patch sized to V0, hoping to reintroduce a
+     coincident edge* - tested directly with a minimal synthetic GDS
+     (baseline vs. baseline+patch, both real DRC runs): **identical**
+     violation count in both. KLayout's DRC engine merges same-layer shapes
+     into one region before computing edges, so a patch fully contained
+     inside the existing merged shape has zero effect on the edge set -
+     there is no way to introduce a new coincident edge without genuinely
+     changing the merged shape's true boundary.
+  3. *Trim a suspected top-level auto-router M1 shape* - disproven directly:
+     zero M1 area anywhere near this V0 is owned by `cell_Block1` itself: both
+     overlapping M1 polygons are explicitly owned by the `BUFx2` instance
+     (one has local bbox `(580,108)-(1008,972)`, an exact match for the
+     notched library polygon). There is no top-level shape to trim.
+  4. *Shift the specific `VIA_VIA12` instance off the notch* - the most
+     promising direction (`VIA_VIA12` is a small, purpose-built via cell,
+     the same *category* of thing safely adjusted all session, unlike V0 or
+     the standard cell's own geometry). Tested empirically via real
+     `evaluate_repair.py`/`check_connectivity.py` re-runs at multiple Y
+     shifts (-60 to +60 raw units) of just this one instance's placement:
+     `dy=+50` does clear the notch and reduce `V0.M1.AUX.3` (37->36), but
+     **breaks connectivity** (`check_connectivity.py`: 2 pin endpoint
+     mismatches) and makes 4 other rules worse in the process (`M1.A.1`
+     +1 new, `M1.S.2` +1, `V1.M1.EN.1` +1, and a NEW `V1.M2.AUX.2` +1 - the
+     very cascade rule this session spent 3 rounds getting right). Root
+     cause: `VIA_VIA12`'s own M1 pad is 88 raw units tall, but the "safe"
+     un-notched zone below the step is only 72 tall - the pad is physically
+     bigger than the space that would avoid the notch entirely, so any
+     vertical shift either straddles the notch (no fix) or moves the via
+     off its correct landing area onto the wrong part of the net (breaks
+     connectivity) - a genuine, hard geometric conflict, not a tuning
+     problem.
+
+  **Conclusion**: the mechanism is fully understood (a via/contact losing
+  a purpose-built flush relationship when something else's metal merges in
+  - the same general family as the V1.M2.AUX.2 cascade), but every
+  concretely-testable fix direction is blocked by a real, measured
+  constraint - diffusion size, KLayout's shape-merging behavior, the
+  absence of a movable top-level shape, or the connectivity gate itself.
+  Not pursued further; this is a genuine dead end, arrived at through
+  direct experiment at every step rather than assumption.
 - `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
