@@ -884,3 +884,26 @@ this way, end to end, before being locked into `agent.py` - but be aware that
 `M4.AUX.1`/`M5.AUX.1`/`M6.AUX.1` counts from the static given `drc_report/`
 files should not be trusted as ground truth for `original_violations`;
 prefer a fresh live DRC run of the pristine script as the actual baseline.
+
+## Token-normalized scoring (organizer formula, see README.md/evaluator/README.md)
+
+Final per-block ranking is not raw repair rate - it's net DRC violations fixed,
+normalized per million tokens spent:
+
+`net_violations_fixed_per_million_tokens = original_violations * (1 - ε) * 1,000,000 / scoring_tokens`
+
+where `ε` is the final violation rate and `scoring_tokens` is the greater of
+`total_tokens` and organizer-set `MINIMUM_SCORING_TOKENS` (not locally
+discoverable - `evaluate_repair.py` has no token-scoring code at all; this is
+computed organizer-side from real usage logs against the real Vertex
+endpoint). Submissions are ranked by this score descending; raw repair rate
+(`γ`) is only the tie-breaker, not the primary metric. Practical implication:
+`agent.py`'s current design (near-zero LLM calls - see "Local evaluation
+works" above and the deterministic-repair approach throughout this document)
+is favorable under this formula precisely because `scoring_tokens` stays at
+the organizer-set floor rather than growing with usage - a token-heavy agent
+with the same repair rate would score lower. `AGENT_GUIDE.md` also states
+agents should "prioritize preserving a runnable KLayout script and the
+provided connectivity reference before optimizing DRC violation counts" -
+i.e. a valid, connectivity-preserving script with a modest repair rate beats
+an invalid or connectivity-broken one, regardless of token cost.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-T19 ASU ICLAD 2026 - Local Vertex AI Express Mode model service (dev/test only)
+T19 ASU ICLAD 2026 - Local Gemini Developer API model service (dev/test only)
 ==================================================================================
 Implements the exact model_endpoint HTTP contract described in AGENT_GUIDE.md
 (POST /generate, GET /health) so agent.py can be exercised end-to-end before
@@ -48,17 +48,23 @@ if _env_file.exists():
 
 
 class GeminiVertexWrapper:
+    """Uses the plain Gemini Developer API (vertexai=False), not Vertex AI
+    Express Mode: the AI Studio key from the frictionless GCP account
+    (billing enabled, higher quota) returns 403 API_KEY_SERVICE_BLOCKED on
+    aiplatform.googleapis.com when vertexai=True is set - verified directly
+    against the live API. Old model names ("gemini-2.5-flash" etc.) return
+    404 "no longer available to new users" on this key - use
+    gemini-3.5-flash instead (confirmed working, and the only current-gen
+    name that still honors thinking_config/thinking_budget=0).
+    """
+
     def __init__(self):
         self.api_key = os.environ.get("EXPRESS_MODE_KEY")
         if not self.api_key:
             print("[WARN] EXPRESS_MODE_KEY environment variable not set.", file=sys.stderr)
         if genai is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
-        self.client = genai.Client(
-            vertexai=True,
-            api_key=self.api_key,
-            http_options={"headers": {"X-Goog-User-Project": ""}},
-        )
+        self.client = genai.Client(api_key=self.api_key)
 
     def generate(self, model, prompt, max_output_tokens=2048):
         config = types.GenerateContentConfig(

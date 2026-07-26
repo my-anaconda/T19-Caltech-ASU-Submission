@@ -94,7 +94,7 @@ remainder not tied to the V1.M2 cascade) and the remaining spacing rules.
 T19-Caltech-ASU-Submission/
 ├── agent.py                 ← the submission agent (this is what gets submitted)
 ├── scripts/
-│   └── model_service.py     ← local Vertex AI Express Mode proxy, dev/test only
+│   └── model_service.py     ← local Gemini Developer API proxy, dev/test only
 ├── NOTES.md                 ← design rationale, prior-version comparison, next steps
 └── README.md                ← this file
 ```
@@ -121,6 +121,18 @@ separately if you want to run it.
    ```bash
    echo 'EXPRESS_MODE_KEY=your_actual_key_here' > .env
    ```
+   Use a Gemini API key from [ai.studio](https://ai.studio) (the frictionless
+   GCP hackathon account gives a billing-enabled project with much higher
+   quota than the free-tier Vertex AI Express Mode this used previously).
+   The env var name `EXPRESS_MODE_KEY` is kept for compatibility, but
+   `model_service.py`'s client now runs in plain Gemini Developer API mode
+   (`vertexai=False`), not Vertex AI Express Mode - a billing-project AI
+   Studio key returns 403 `API_KEY_SERVICE_BLOCKED` on
+   `aiplatform.googleapis.com` if `vertexai=True` is set. Also note: older
+   model names (`gemini-2.5-flash`, `gemini-2.0-flash-exp`) return 404 "no
+   longer available to new users" on a fresh project's key -
+   `gemini-3.5-flash` is confirmed working and is the only current-generation
+   name that still honors `thinking_config`/`thinking_budget=0`.
 
 ## Running
 
