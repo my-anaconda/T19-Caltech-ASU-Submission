@@ -966,3 +966,88 @@ on a LEF+DEF design database, not GDS directly. The still-unbuilt bridge:
 Next session: prototype steps 1-3 against one real block (e.g. Block1) to
 confirm `detailed_placement` actually runs and produces a legal result
 before investing in steps 4-5.
+
+## Steps 1-3 prototyped and verified against Block1 (2026-07-26) - real result
+
+### Extraction (step 1)
+
+Ran `Block1.py` in KLayout batch mode and walked the resulting `Block1` cell's
+instances directly (`top.each_inst()`) rather than re-parsing the script or
+round-tripping through the GDS the script itself writes. Of 652 total
+instances, 143 are real standard cells matching the bundled ASAP7 LEF's exact
+naming (`BUFx3_ASAP7_75t_R`, `FAx1_ASAP7_75t_R`, `TAPCELL_ASAP7_75t_R`, etc. -
+all 212 macros in `asap7sc7p5t_28_R_1x_220121a.lef` cover every cell type this
+block actually uses); the other 509 are `VIA_*` routing-primitive cells with
+no LEF entry (correctly excluded - not legalizer targets).
+
+### Orientation mapping bug caught and fixed (important - would have been silent)
+
+Building the DEF requires mapping `pya.Trans`'s packed rotation code (0-7,
+where 4-7 encode rotation + `is_mirror()=True`) to DEF's `ORIENT` strings (N,
+S, E, W, FN, FS, FE, FW). My first attempt was a guess based on typical
+rotation-then-mirror composition order and was **wrong for all 4 of the
+mirrored codes**. Caught by empirically verifying against the real OpenROAD
+`odb` API instead of trusting the guess: generated one-instance DEFs for all
+8 `ORIENT` strings using a real cell (`BUFx3_ASAP7_75t_R`), read them back via
+`ord::get_db_block`, and compared the resulting `VDD`/pin-`A` pin bounding
+boxes against the same 8 `pya.Trans` codes applied to the cell's real LEF pin
+geometry (re-anchored to the cell's bbox corner, matching DEF's placement
+convention). Verified mapping (used in the actual DEF generator):
+`{0:N, 1:W, 2:S, 3:E, 4:FS, 5:FW, 6:FN, 7:FE}` - note 4-7 map to
+`FS/FW/FN/FE`, not the naively-guessed `FN/FE/FS/FW`.
+
+### DEF generation (step 2) - format gotchas
+
+- KLayout's DBU (0.00025 um/unit) and the ASAP7 tech LEF's DBU
+  (`DATABASE MICRONS 1000`, i.e. 0.001 um/unit) differ by exactly 4x; every
+  instance coordinate extracted from Block1 converts to an exact integer DEF
+  coordinate under `* 0.25` (verified for all 143 instances - no rounding/
+  off-grid surprises).
+- Row grid: the real site (`asap7sc7p5t`, `SIZE 0.054 BY 0.270`) is 270 DEF
+  units tall; Block1's 143 cells only ever land on *even* row-indices of that
+  grid (never odd) - odd rows sit empty. Rows are defined at the true site
+  pitch (not a doubled pitch) spanning the observed instance bounding box.
+- DEF's `ROW` section has **no** `ROWS <n> ;`/`END ROWS` wrapper (unlike
+  `COMPONENTS`) - just consecutive `ROW` lines. Got this wrong on the first
+  attempt (copied the `COMPONENTS`-style wrapper pattern) and confirmed the
+  fix against a real bundled example DEF
+  (`flow/designs/nangate45/aes/aes_ng45_fp.def`).
+
+### Legalization (step 3) - real, verified success
+
+Loaded the generated `block1.def` with the real ASAP7 tech + cell LEF and ran
+`check_placement` **before** touching anything: it failed with **70 real
+overlap violations** (e.g. `inst_104_TAPCELL` at the exact same `(x,y)` as
+`inst_105_TAPCELL`, just different orientation; `inst_116_FAx1` - a
+0.756um-wide cell, not 0.324um like `BUFx3` - genuinely overlapping the
+neighboring `FILLERxp5` by 0.432um). Spot-checked two of these by hand against
+each cell's real LEF `SIZE` to confirm they are genuine overlaps, not an
+artifact of the DEF conversion.
+
+Ran `detailed_placement -max_displacement 2` (2 sites/rows cap): converged
+from 44 violations to 0 in 9 iterations (negotiation legalizer), followed by
+`check_placement` passing cleanly. Displacement stayed small: **total 28.7um
+across all 143 cells, average 0.2um, max 1.1um**. Concretely, both spot-
+checked overlaps were resolved with a clean single-row shift (270 DEF
+units = 0.27um = exactly one row height) and zero X movement:
+- `inst_104_TAPCELL`: `(432,1620)` -> `(432,1890)` (+1 row); `inst_105`
+  (the identical-position duplicate) stayed put.
+- `inst_116_FAx1`: `(2160,1080)` -> `(2160,1350)` (+1 row), resolving its
+  X-overlap with `inst_115_FILLERxp5` by relocating to a clear row instead
+  of shifting X.
+
+**This is a materially different class of violation than the via/pad
+shape-merge issues this repo's current geometric patches target** - genuine
+standard-cell-level physical overlaps, not sub-cell notch/coverage issues.
+The two approaches look complementary rather than overlapping in scope.
+
+### Still not done: steps 4-5 (patch KLayout script + re-routing)
+
+Have not yet: diffed legalized vs. original positions to build a per-
+instance delta list, applied those deltas to `Block1.py`'s own
+`pya.CellInstArray(...)` calls (keeping it a runnable KLayout script per
+`AGENT_GUIDE.md`), or touched routing at all. Every moved cell's local
+wires/vias will need re-stitching - still the hardest, unstarted part.
+Scratch scripts from this session (`extract_instances.py`, `gen_def.py`,
+the orientation-resolution scripts) are throwaway prototypes, not yet
+integrated into `agent.py`.
