@@ -233,10 +233,23 @@ def apply_validated_fixes(script_text):
 #     targets exactly (136/480/640, matching NOTES.md's original derivation).
 # ---------------------------------------------------------------------------
 
+# Matches pya.Polygon([...]) with ANY number of points (>= 3), not just the
+# 4-point rectangles this engine originally assumed. Confirmed necessary by
+# direct inspection: unrelated standard cells (e.g. BUFx2_ASAP7_75t_R) define
+# non-rectangular M1 shapes with 8-12 points (real jogged routing shapes) -
+# a fixed 4-point pattern silently skips these entirely, which is exactly
+# what broke the first M1-safety check attempt (it found zero obstacles
+# where real KLayout pya.Region found a very real one - see NOTES.md's
+# "M1 safety" section). Bbox-only is still safe to use here: every consumer
+# either (a) treats OTHER cells' shapes as keep-out obstacles, where a
+# bounding box is a conservative (never unsafe) over-approximation, or
+# (b) operates on the validated via/pad cells this engine already confirmed
+# are plain 4-point rectangles (via the separate, still-4-point-specific
+# _POLY_INSERT_RE_TMPL used for the known fixed-target edits).
+_POINT_RE = re.compile(r"pya\.Point\((-?\d+), (-?\d+)\)")
 _ANY_POLY_INSERT_RE = re.compile(
-    r"(?P<var>p\w+) = pya\.Polygon\(\[pya\.Point\((?P<x0>-?\d+), (?P<y0>-?\d+)\), "
-    r"pya\.Point\((?P<x1>-?\d+), (?P<y1>-?\d+)\), pya\.Point\((?P<x2>-?\d+), (?P<y2>-?\d+)\), "
-    r"pya\.Point\((?P<x3>-?\d+), (?P<y3>-?\d+)\)\]\)\r?\n"
+    r"(?P<var>p\w+) = pya\.Polygon\(\[(?P<points>pya\.Point\(-?\d+, -?\d+\)"
+    r"(?:, pya\.Point\(-?\d+, -?\d+\))*)\]\)\r?\n"
     r"cell_(?P<cellvar>\w+)\.shapes\(layout\.layer\(pya\.LayerInfo\((?P<layer>\d+), 0\)\)\)\.insert\((?P=var)\)"
 )
 _ANY_INST_RE = re.compile(
@@ -253,12 +266,15 @@ def _poly_bbox(pts):
 
 def _parse_all_shapes(script_text):
     """Returns {cellvar: {layer: [bbox, ...]}} for every pXXX=Polygon(...)/
-    .insert(pXXX) statement in the script (any cell, any layer, file order)."""
+    .insert(pXXX) statement in the script (any cell, any layer, any number of
+    points >= 3, file order). Shapes are reduced to their bounding box - see
+    _ANY_POLY_INSERT_RE's comment for why that's safe for every current use."""
     shapes = defaultdict(lambda: defaultdict(list))
     for m in _ANY_POLY_INSERT_RE.finditer(script_text):
         cellvar = m.group("cellvar")
         layer = int(m.group("layer"))
-        pts = tuple(int(m.group(g)) for g in ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3"))
+        coords = _POINT_RE.findall(m.group("points"))
+        pts = tuple(int(v) for pair in coords for v in pair)
         shapes[cellvar][layer].append(_poly_bbox(pts))
     return shapes
 
@@ -815,20 +831,371 @@ def apply_dynamic_v2m3_fix(script_text, shift_map):
         default_range=_V2M3_DEFAULT_RANGE, var_id_start=900000)
 
 
+# ---------------------------------------------------------------------------
+# V1.M2.AUX.2 local-patch fix.
+#
+# The whole-pad growth apply_dynamic_v2m3_fix() uses (safe for VIA_VIA23,
+# whose M2 pad only spans its own 3 vias) is NOT safe for this rail cell:
+# its M1 pad spans the ENTIRE row (thousands of raw units), so growing it as
+# one rectangle to satisfy even a single via's M2-driven target reaches
+# across the whole row and can silently merge into UNRELATED standard-cell
+# M1 shapes anywhere along that row. This was tried and confirmed broken via
+# real KLayout connectivity re-run (460 pin-endpoint + 381 routing-endpoint
+# mismatches, modified_paths_count 8260 vs golden 1350) - root-caused via
+# direct pya.Region probing to the pad growing into another standard cell's
+# M1 pin it had no relationship to. See NOTES.md's "V1.M2.AUX.2 cascade"
+# section for the full account.
+#
+# The fix: grow ONLY the specific via that needs it, and add a small LOCAL
+# M1 patch (that via's own X span, +/- a fixed enclosure margin) instead of
+# resizing the whole row-wide pad - every edit stays local to where it's
+# actually needed, and the untouched pad/other vias are left completely
+# alone.
+#
+# A second, independent safety check beyond the existing M2-merge-topology
+# one is required: growing M1 can come close to OTHER, unrelated M1 shapes
+# nearby, some of them non-rectangular (confirmed directly: unrelated
+# standard cells like BUFx2_ASAP7_75t_R define M1 routing as 8-12 point
+# jogged polygons, not simple rectangles - _ANY_POLY_INSERT_RE was
+# generalized to see these; a 4-point-only parser silently missed them,
+# which is exactly what made an earlier version of this M1-safety check
+# find "no obstacle" where a real one existed). Each via's final growth is
+# the INTERSECTION of what the M2 side allows AND what the M1 side allows
+# (nearest foreign M1 obstacle, kept at least _M1_SPACING_CUSHION_RAW away) -
+# never just one or the other, and never less than the original default
+# range either direction.
+# ---------------------------------------------------------------------------
+
+_M1_ENCLOSURE_MARGIN_RAW = 24   # 6nm - comfortably above V1.M1.EN.1's 5nm/2nm requirement
+_M1_SPACING_CUSHION_RAW = 144   # 36nm - comfortably above every M1.S.* rule's max threshold (31nm)
+
+
+def _m1_safe_range_for_patch(foreign_m1_boxes, patch_x0, patch_x1, default_y0, default_y1, cushion):
+    """Given FOREIGN (unrelated) M1 boxes, finds how far a NEW M1 patch
+    spanning [patch_x0, patch_x1] can grow in Y from [default_y0, default_y1]
+    (its floor - it can only ever grow, never shrink) without coming within
+    `cushion` of any foreign M1 shape.
+
+    A first version only considered foreign shapes whose X range directly
+    overlapped the patch's - real KLayout DRC re-run showed this misses
+    CORNER-to-corner proximity (M1.S.3/S.4/S.6, all corner/tip spacing
+    rules): a foreign shape sitting just outside the patch's X range but
+    close enough diagonally can still violate those without ever overlapping
+    in X. Fixed by treating any foreign shape within `cushion` of the patch's
+    X range (not just directly overlapping it) as relevant, and requiring
+    the same Y cushion from it - this guarantees at least `cushion` of true
+    Euclidean separation in the worst case (a foreign shape right at that
+    X-cushion boundary), not just Y-only clearance for X-overlapping shapes.
+    Returns (safe_y0, safe_y1)."""
+    above = [b for b in foreign_m1_boxes
+             if b[0] < patch_x1 + cushion and b[2] > patch_x0 - cushion and b[1] >= default_y1]
+    below = [b for b in foreign_m1_boxes
+             if b[0] < patch_x1 + cushion and b[2] > patch_x0 - cushion and b[3] <= default_y0]
+    upper = min((b[1] for b in above), default=None)
+    lower = max((b[3] for b in below), default=None)
+    safe_y1 = max(default_y1, upper - cushion) if upper is not None else default_y1 + 10**9
+    safe_y0 = min(default_y0, lower + cushion) if lower is not None else default_y0 - 10**9
+    return (safe_y0, safe_y1)
+
+
+_V0_LAYER = 18   # V0 (active/poly -> M1 contact) - checked as a third safety
+                 # constraint, NOT modified by this fix
+
+
+def _v0_safe_range_for_via(foreign_v0_boxes, x0, x1, default_y0, default_y1):
+    """A V0 contact that sits FLUSH against the default M1 edge (by design -
+    confirmed via real KLayout GUI inspection, multiple examples, all the
+    same mechanism: a step/corner in M1's edge lining up with a V0's own
+    edge) depends on that exact alignment for V0.M1.AUX.3 ("V0 must exactly
+    match M1's width perpendicular to M1's length" - the same rule family as
+    V1.M2.AUX.2/V2.M3.AUX.2, one layer further down). Moving M1's edge away
+    from such a V0 - even though it's a real, otherwise-safe direction to
+    grow M1 in - breaks that flush relationship and creates a NEW
+    V0.M1.AUX.3 violation. A first version of this fix didn't check this at
+    all: real KLayout DRC re-run showed an almost exact 1-for-1 trade (every
+    via whose V1.M2.AUX.2 got fixed cost one new V0.M1.AUX.3 violation
+    nearby). Caps growth in whichever direction has a flush V0 at this via's
+    location; the other direction (if no flush V0 there) is unrestricted."""
+    overlapping = [b for b in foreign_v0_boxes if b[0] < x1 and b[2] > x0]
+    blocked_down = any(b[1] == default_y0 for b in overlapping)
+    blocked_up = any(b[3] == default_y1 for b in overlapping)
+    safe_y0 = default_y0 if blocked_down else default_y0 - 10**9
+    safe_y1 = default_y1 if blocked_up else default_y1 + 10**9
+    return (safe_y0, safe_y1)
+
+
+def _insert_extra_shapes(script_text, cell_name, extra_shapes, var_id_start):
+    """Appends new pXXX=Polygon(...)/.insert(pXXX) statement pairs directly
+    into an EXISTING cell definition, right after its last existing shape -
+    used to add new M1 enclosure patches to the shared/base cell in place,
+    without creating a whole new cell. `extra_shapes` is a list of
+    (layer, x0, y0, x1, y1). Numeric-only p{N} variable names, per
+    check_connectivity.py's hardcoded p\\d+ parsing requirement (see the
+    module comment above apply_dynamic_v2m3_fix). Returns
+    (patched_text, applied_list)."""
+    pattern = re.compile(_POLY_INSERT_RE_TMPL.format(cell=re.escape(cell_name)))
+    matches = list(pattern.finditer(script_text))
+    insert_at = max(m.end() for m in matches)
+    lines = []
+    applied = []
+    var_id = var_id_start
+    for layer, x0, y0, x1, y1 in extra_shapes:
+        var_id += 1
+        var = f"p{var_id}"
+        lines.append(
+            f"{var} = pya.Polygon([pya.Point({x0}, {y0}), pya.Point({x0}, {y1}), "
+            f"pya.Point({x1}, {y1}), pya.Point({x1}, {y0})])"
+        )
+        lines.append(f"cell_{cell_name}.shapes(layout.layer(pya.LayerInfo({layer}, 0))).insert({var})")
+        applied.append(f"{cell_name}:layer{layer}:{var}(new M1 enclosure patch)")
+    script_text = script_text[:insert_at] + "\n" + "\n".join(lines) + script_text[insert_at:]
+    return script_text, applied
+
+
+def _apply_v1m2_local_patch_fix(script_text, shift_map, *, cell_name, var_id_start):
+    """Merge-aware, per-via, LOCAL-PATCH fix for V1.M2.AUX.2 - see the
+    module comment above. Returns (patched_text, applied_list, skipped_list)."""
+    shapes = _parse_all_shapes(script_text)
+    instances = _parse_all_instances(script_text)
+    effective_instances = [
+        (t, s, r, m, x, shift_map.get((t, s, x, y), y))
+        for (t, s, r, m, x, y) in instances
+    ]
+
+    applied = []
+    skipped = []
+
+    local_by_layer = shapes.get(cell_name, {})
+    if not local_by_layer:
+        return script_text, applied, [(cell_name, "cell not present in this case")]
+
+    layer_spec = {_V1M2_PAD_LAYER: 1, _V1M2_REF_LAYER: 1, _V1M2_VIA_LAYER: None}
+    structure_ok = (set(local_by_layer) <= set(layer_spec) and
+                     all((count is None and len(local_by_layer.get(layer, [])) >= 1) or
+                         len(local_by_layer.get(layer, [])) == count
+                         for layer, count in layer_spec.items()))
+    if not structure_ok:
+        found = {l: len(v) for l, v in local_by_layer.items()}
+        return script_text, applied, [(cell_name, f"structure mismatch: found layers={found}")]
+
+    local_ref_bbox = local_by_layer[_V1M2_REF_LAYER][0]
+    local_via_bboxes = local_by_layer[_V1M2_VIA_LAYER]
+    local_pad_bbox = local_by_layer[_V1M2_PAD_LAYER][0]
+    n_vias = len(local_via_bboxes)
+    default_range = _V1M2_DEFAULT_RANGE
+
+    by_result = defaultdict(list)  # via_ranges_tuple -> [(topvar, x, y), ...]
+    for (topvar, subvar, rot, mirror, x, y) in instances:
+        if subvar != cell_name:
+            continue
+        abs_ref_bbox = _transform_bbox(local_ref_bbox, rot, mirror, x, y)
+        all_ref_boxes = _flatten_layer(topvar, _V1M2_REF_LAYER, shapes, effective_instances)
+        group_members = _merged_group_members_containing(all_ref_boxes, abs_ref_bbox)
+        if group_members is None:
+            skipped.append((f"{cell_name}@({x},{y})", "instance's own reference-layer shape not found in flattened layer - skipped"))
+            continue
+
+        eff_y = shift_map.get((topvar, cell_name, x, y), y)
+        foreign_instances = [
+            inst for inst in effective_instances
+            if not (inst[0] == topvar and inst[1] == cell_name and inst[4] == x and inst[5] == eff_y)
+        ]
+        foreign_m1_boxes = _flatten_layer(topvar, _V1M2_PAD_LAYER, shapes, foreign_instances)
+        foreign_v0_boxes = _flatten_layer(topvar, _V0_LAYER, shapes, effective_instances)
+        default_abs_y0, default_abs_y1 = y + default_range[0], y + default_range[1]
+
+        via_ranges = []
+        ok = True
+        for via_bbox in local_via_bboxes:
+            vx0, vy0, vx1, vy1 = via_bbox
+            abs_x0, abs_x1 = x + vx0, x + vx1
+            m2_safe = _safe_y_range_for_x_range(group_members, abs_x0, abs_x1)
+            if m2_safe is None:
+                ok = False
+                break
+            m2_local = (m2_safe[0] - y, m2_safe[1] - y)
+
+            patch_x0, patch_x1 = abs_x0 - _M1_ENCLOSURE_MARGIN_RAW, abs_x1 + _M1_ENCLOSURE_MARGIN_RAW
+            m1_safe_abs = _m1_safe_range_for_patch(
+                foreign_m1_boxes, patch_x0, patch_x1,
+                default_abs_y0, default_abs_y1, _M1_SPACING_CUSHION_RAW)
+            m1_local = (m1_safe_abs[0] - y, m1_safe_abs[1] - y)
+
+            v0_safe_abs = _v0_safe_range_for_via(
+                foreign_v0_boxes, patch_x0, patch_x1, default_abs_y0, default_abs_y1)
+            v0_local = (v0_safe_abs[0] - y, v0_safe_abs[1] - y)
+
+            # intersect everything M2, M1, and V0 each allow, then clamp so
+            # this via's range never shrinks past its original default
+            final_y0 = min(max(m2_local[0], m1_local[0], v0_local[0]), default_range[0])
+            final_y1 = max(min(m2_local[1], m1_local[1], v0_local[1]), default_range[1])
+            via_ranges.append((final_y0, final_y1))
+        if not ok:
+            skipped.append((f"{cell_name}@({x},{y})", "could not compute a safe range for one of its vias - skipped"))
+            continue
+
+        by_result[tuple(via_ranges)].append((topvar, x, y))
+
+    if not by_result:
+        return script_text, applied, skipped
+
+    default_key = (default_range,) * n_vias
+
+    def _patches_for(via_ranges):
+        """Builds (via_edits, extra_patch_specs) for one instance's computed
+        per-via ranges. Adjacent vias that both need growth get merged into
+        ONE shared patch (rather than one patch each) when the gap between
+        their individual patches would be less than the spacing cushion -
+        confirmed necessary via real KLayout DRC re-run: two separate,
+        closely-spaced patches can trigger M1.S.4 (tip-to-tip spacing)
+        AGAINST EACH OTHER, a self-inflicted violation the per-via M1-safety
+        check (which only looks for FOREIGN obstacles) doesn't catch, since
+        neither patch is foreign to the other's own instance. Merging uses
+        the INTERSECTION of the group's individual ranges (never wider than
+        any member's own computed-safe range, so never less safe), clamped
+        to never shrink past default - see NOTES.md's "V1.M2.AUX.2 cascade"
+        section for the real marker coordinates that exposed this."""
+        growing = []
+        for i, r in enumerate(via_ranges):
+            if r == default_range:
+                continue
+            vx0, _, vx1, _ = local_via_bboxes[i]
+            growing.append((vx0, vx1, i, r))
+        growing.sort(key=lambda t: t[0])
+
+        clusters = []  # [x0, x1, [(i, r), ...]]
+        for vx0, vx1, i, r in growing:
+            if clusters and vx0 - clusters[-1][1] < _M1_SPACING_CUSHION_RAW:
+                clusters[-1][1] = max(clusters[-1][1], vx1)
+                clusters[-1][2].append((i, r))
+            else:
+                clusters.append([vx0, vx1, [(i, r)]])
+
+        via_edits = {}
+        extra = []
+        for cx0, cx1, members in clusters:
+            merged_y0 = min(max(r[0] for _, r in members), default_range[0])
+            merged_y1 = max(min(r[1] for _, r in members), default_range[1])
+            for i, _ in members:
+                via_edits[i] = (merged_y0, merged_y1)
+            if (merged_y0, merged_y1) != default_range:
+                extra.append((_V1M2_PAD_LAYER, cx0 - _M1_ENCLOSURE_MARGIN_RAW, merged_y0,
+                              cx1 + _M1_ENCLOSURE_MARGIN_RAW, merged_y1))
+        return via_edits, extra
+
+    # Exactly one group keeps the shared/base cell definition (preferring the
+    # literal default if present, otherwise the largest group) - same
+    # orphaned-base-cell reasoning as apply_dynamic_v2m3_fix (see NOTES.md).
+    if default_key in by_result:
+        base_key = default_key
+    else:
+        base_key = max(by_result, key=lambda k: len(by_result[k]))
+    base_group = by_result.pop(base_key)
+
+    base_edits, base_extra = _patches_for(base_key)
+    if base_edits:
+        via_transforms = [_set_y_range(*base_edits[i]) if i in base_edits else None
+                          for i in range(n_vias)]
+        patched, applied_base, skipped_base = _apply_cell_fix_specs(
+            script_text, {cell_name: {
+                _V1M2_PAD_LAYER: [None],
+                _V1M2_REF_LAYER: [None],
+                _V1M2_VIA_LAYER: via_transforms,
+            }})
+        script_text = patched
+        skipped.extend(skipped_base)
+        if base_extra:
+            script_text, applied_patch = _insert_extra_shapes(script_text, cell_name, base_extra, var_id_start)
+            applied_base = applied_base + applied_patch
+        tag = "default" if base_key == default_key else "base (largest non-default group)"
+        applied.extend(f"{a} ({tag}, {len(base_group)} instance(s))" for a in applied_base)
+    else:
+        applied.append(f"{cell_name}: base group unchanged (default, {len(base_group)} instance(s))")
+
+    if by_result:
+        placement_edits = []
+        block_pattern = re.compile(_POLY_INSERT_RE_TMPL.format(cell=re.escape(cell_name)))
+        block_matches = list(block_pattern.finditer(script_text))
+        shapes_insert_at = max(m.end() for m in block_matches)
+        cell_def_match = re.search(_CELL_DEF_RE_TMPL.format(cell=re.escape(cell_name)), script_text)
+        if cell_def_match is None:
+            skipped.append((cell_name, "could not find cell definition line to anchor new custom cell declarations"))
+            return script_text, applied, skipped
+        create_cell_insert_at = cell_def_match.end()
+
+        new_cell_decls = []
+        new_cells_text = []
+        _new_var_counter = [var_id_start + 50000]
+
+        def _new_var():
+            _new_var_counter[0] += 1
+            return f"p{_new_var_counter[0]}"
+
+        for cell_idx, (via_ranges, insts) in enumerate(sorted(by_result.items())):
+            custom_name = f"{cell_name}_C{cell_idx}"
+            new_cell_decls.append(f'cell_{custom_name} = layout.create_cell("{custom_name}")')
+            lines = []
+
+            def _emit(layer, x0, ny0, x1, ny1):
+                var = _new_var()
+                lines.append(
+                    f"{var} = pya.Polygon([pya.Point({x0}, {ny0}), "
+                    f"pya.Point({x0}, {ny1}), pya.Point({x1}, {ny1}), "
+                    f"pya.Point({x1}, {ny0})])"
+                )
+                lines.append(
+                    f"cell_{custom_name}.shapes(layout.layer(pya.LayerInfo({layer}, 0))).insert({var})"
+                )
+
+            px0, py0, px1, py1 = local_pad_bbox
+            _emit(_V1M2_PAD_LAYER, px0, py0, px1, py1)  # unchanged, full-row pad
+            rx0, ry0, rx1, ry1 = local_ref_bbox
+            _emit(_V1M2_REF_LAYER, rx0, ry0, rx1, ry1)  # unchanged
+            via_edits, extra = _patches_for(via_ranges)
+            for i, via_bbox in enumerate(local_via_bboxes):
+                vx0, vy0, vx1, vy1 = via_bbox
+                if i in via_edits:
+                    _emit(_V1M2_VIA_LAYER, vx0, via_edits[i][0], vx1, via_edits[i][1])
+                else:
+                    _emit(_V1M2_VIA_LAYER, vx0, vy0, vx1, vy1)  # unchanged
+            for layer, x0, y0, x1, y1 in extra:
+                _emit(layer, x0, y0, x1, y1)
+
+            new_cells_text.append("\n".join(lines))
+            applied.append(f"{cell_name}:custom_cell={custom_name} "
+                            f"{len(extra)} local M1 patch(es) ({len(insts)} instance(s))")
+
+            for (topvar, x, y) in insts:
+                old_line_re = re.compile(_PLACEMENT_RE_TMPL.format(
+                    topcell=re.escape(topvar), cell=re.escape(cell_name), x=x, y=y))
+                inst_matches = list(old_line_re.finditer(script_text))
+                if len(inst_matches) != 1:
+                    skipped.append((f"{cell_name}@({x},{y})",
+                                     "could not uniquely locate this instance's placement line - skipped"))
+                    continue
+                im = inst_matches[0]
+                new_line = im.group(0).replace(f"cell_{cell_name}.cell_index()",
+                                                f"cell_{custom_name}.cell_index()")
+                placement_edits.append((im.start(), im.end(), new_line))
+
+        for start, end, replacement in sorted(placement_edits, key=lambda e: e[0], reverse=True):
+            script_text = script_text[:start] + replacement + script_text[end:]
+
+        script_text = script_text[:shapes_insert_at] + "\n" + "\n".join(new_cells_text) + script_text[shapes_insert_at:]
+        script_text = script_text[:create_cell_insert_at] + "\n" + "\n".join(new_cell_decls) + script_text[create_cell_insert_at:]
+
+    return script_text, applied, skipped
+
+
 def apply_dynamic_v1m2_fix(script_text, shift_map):
-    """Merge-aware, per-via, shape-aware fix for V1.M2.AUX.2 - the same
-    mechanism as apply_dynamic_v2m3_fix, one metal layer down. See the
-    module-level comment above _V1M2_NAME_RE. Returns (patched_text,
-    applied_list, skipped_list)."""
+    """Local-patch, per-via, shape-aware fix for V1.M2.AUX.2. See the
+    module-level comment above _apply_v1m2_local_patch_fix. Returns
+    (patched_text, applied_list, skipped_list)."""
     cell_name = _find_cell_name_matching(script_text, _V1M2_NAME_RE)
     if cell_name is None:
         return script_text, [], [("VIA_via1_2_*", "no matching cell found in this case")]
-    layer_spec = {_V1M2_PAD_LAYER: 1, _V1M2_REF_LAYER: 1, _V1M2_VIA_LAYER: None}
-    return _apply_dynamic_merge_aware_fix(
-        script_text, shift_map,
-        cell_name=cell_name, layer_spec=layer_spec,
-        ref_layer=_V1M2_REF_LAYER, pad_layer=_V1M2_PAD_LAYER, via_layer=_V1M2_VIA_LAYER,
-        default_range=_V1M2_DEFAULT_RANGE, var_id_start=950000)
+    return _apply_v1m2_local_patch_fix(
+        script_text, shift_map, cell_name=cell_name, var_id_start=950000)
 
 
 def parse_error_payload(error_text):
@@ -922,24 +1289,17 @@ def main():
     # the post-grid-shift geometry (see apply_dynamic_v2m3_fix's docstring).
     patched_script, v2m3_applied, v2m3_skipped = apply_dynamic_v2m3_fix(original_script, shift_map)
 
-    # NOTE: apply_dynamic_v1m2_fix() (V1.M2.AUX.2, one cascade level further
-    # down) is implemented but deliberately NOT called here. Real KLayout
-    # connectivity re-run showed it breaks connectivity (824/824 sources ok,
-    # but 460 pin-endpoint + 381 routing-endpoint mismatches on Block1) even
-    # though its own DRC-driving computation (safe range vs. M2's merge
-    # topology) is correct in isolation: growing the rail's M1 pad to satisfy
-    # V1.M2.AUX.2 can grow it into OTHER, unrelated M1 shapes nearby (e.g.
-    # standard-cell M1 pins in the same row) that were never checked, because
-    # the safe-range computation only validates against the reference layer's
-    # (M2) merge topology, not the pad layer's (M1) own neighbors - confirmed
-    # via direct pya.Region probing: the grown region at Block1 row y=3240
-    # extends into Y=3348-3380 where unrelated M1 shapes already sit. Fixing
-    # this properly would need an M1-side "safe range" check analogous to
-    # _safe_y_range_for_x_range, intersected with the M2-side one - deferred,
-    # see NOTES.md's "V1.M2.AUX.2" section. Confirmed via direct re-run that
-    # skipping this fix (only) restores connectivity exactly (1350/1350
-    # paths, 0 mismatches) - see NOTES.md.
-    v1m2_applied, v1m2_skipped = [], []
+    # V1.M2.AUX.2 fix - the same cascade mechanism as V2.M3.AUX.2 above, one
+    # metal layer down. A first (whole-pad-growth) version broke connectivity
+    # outright; the current local-patch version grows only the specific via
+    # that needs it (plus a small local M1 patch), checked against THREE
+    # independent safety constraints (M2 merge topology, foreign M1 shapes
+    # including non-rectangular ones, and V0 contacts flush against the
+    # default M1 edge) before ever growing anything - see NOTES.md's
+    # "V1.M2.AUX.2 cascade" section for the full derivation, including two
+    # earlier versions that were tried and found wanting (real KLayout
+    # connectivity/DRC re-run each time, not assumed).
+    patched_script, v1m2_applied, v1m2_skipped = apply_dynamic_v1m2_fix(patched_script, shift_map)
 
     # Fixed-target via-growth fixes (V4.M5.AUX.2, V5.M6.AUX.2).
     patched_script, applied, skipped = apply_validated_fixes(patched_script)

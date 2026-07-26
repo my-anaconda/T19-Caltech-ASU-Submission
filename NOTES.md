@@ -423,8 +423,8 @@ alternative - they were never fixed to begin with, and the alternative
 (shipping the unsafe version) breaks the hard connectivity gate entirely.
 
 **Verified end-to-end, real KLayout 0.30.1 + `check_connectivity.py`, all 5
-blocks, current locked-in state (v4 grid formula + v5 merge-aware V2.M3.AUX.2
-+ the original 3 fixed-target fixes, v1m2 NOT applied):**
+blocks, this intermediate locked-in state (v4 grid formula + v5 merge-aware
+V2.M3.AUX.2 + the original 3 fixed-target fixes, v1m2 NOT applied):**
 
 | Case | Pristine floor (live) | Repaired `final_violation_rate` | `repair_rate` | `connectivity_preserved` |
 |---|---:|---:|---:|---|
@@ -440,6 +440,125 @@ over the v3 table above (e.g. Block1 0.8852 → 0.6475), driven by the v4 exact
 grid formula covering every off-grid row (not just residue=6) and the v5
 merge-aware fix resolving `V2.M3.AUX.2` completely (0 remaining, vs. partial
 before) instead of trading it for collateral damage.
+
+This was NOT the final state - see the next section, where the same
+`V1.M2.AUX.2` cascade was revisited with a redesigned, local-patch approach
+that ships correctly.
+
+## `V1.M2.AUX.2` cascade, take 2: local patches (v8) - shipped
+
+Picking the whole-pad-growth attempt back up, three further rounds of real
+KLayout validation were needed before it was actually safe to ship. Each
+round found a genuinely different failure mode - not variations on the same
+bug - which is why this took three passes rather than one:
+
+**Round 1: grow locally, not the whole row.** The v6→v7 revert's root cause
+was growing the pad as ONE rectangle spanning the entire row (thousands of
+raw units), which reaches far past where growth is actually needed. Traced
+the specific violating vias directly: at Block1's row Y=3240, the vias that
+actually need growth sit at X≈2772-2988 - nowhere near the X≈6208-6752
+standard-cell pin the whole-row growth collided with. Fix: grow ONLY the
+specific via that needs it, plus a small local M1 "patch" (that via's own
+X span ± a fixed 6nm enclosure margin), leaving the rest of the row-wide
+pad completely untouched. Verified via `check_connectivity.py`: connectivity
+fully restored (1350/1350 paths, 0 mismatches).
+
+**A parser blind spot surfaced along the way.** The M1-safety check (find
+foreign M1 obstacles near a candidate patch) initially found *zero*
+obstacles where real KLayout found a very real one. Root cause: `agent.py`'s
+shape parser (`_ANY_POLY_INSERT_RE`) only recognized exactly-4-point
+(rectangular) polygons - direct inspection showed unrelated standard cells
+(e.g. `BUFx2_ASAP7_75t_R`) define M1 routing as genuine 8-12-point jogged
+polygons, invisible to a 4-point-only pattern. Considered shelling out to
+real KLayout (`pya`) as a subprocess instead (explicitly permitted by
+`AGENT_GUIDE.md`), but since every fix in this agent only ever touches M1
+and above (never contacts/poly/diffusion/well - confirmed by listing every
+layer number touched: 19/20/21/25/30/40/45/50/55/60), a bounding-box
+approximation is provably safe for this specific use (an obstacle's bbox is
+always a conservative *super*-set of its true footprint, so treating other
+cells' shapes as keep-out zones via bbox can only make the check MORE
+cautious, never less) - so `_ANY_POLY_INSERT_RE` was generalized to match
+any N-point polygon (bbox math already handles any point count) instead,
+keeping `agent.py` pure-stdlib. Confirmed all 1540-3727 polygon statements
+across all 7 blocks are single-line (no multi-line polygon literals to
+worry about) before trusting the regex.
+
+**Round 2: diagonal/corner proximity, not just directly-above/below.** The
+per-via M1 safety check only considered foreign shapes whose X range
+directly overlapped the candidate patch's - real KLayout DRC re-run showed
+this misses CORNER-to-corner spacing rules (`M1.S.3/S.4/S.6`): a foreign
+shape sitting just outside the patch's X range but close enough diagonally
+still violates them without ever X-overlapping. Fixed by treating any
+foreign shape within the spacing cushion (36nm, safely above every `M1.S.*`
+threshold) of the patch's X range as relevant, not just directly-overlapping
+ones - guarantees true Euclidean separation of at least the cushion in the
+worst case, not just Y-only clearance.
+
+**Round 2b: self-inflicted spacing between our OWN adjacent patches.**
+Fixing the above still left new `M1.S.4` (tip-to-tip, <24nm edges: 31nm min)
+violations - traced via real DRC markers to edges exactly 6nm apart at the
+same X (matching the 6nm enclosure margin exactly). Root cause: two
+adjacent vias in the SAME instance both needing growth got two SEPARATE
+patches, close enough to violate spacing against EACH OTHER (a foreign-
+obstacle check can't catch this since neither patch is foreign to the
+other). Fixed by merging adjacent patches whose gap would be less than the
+spacing cushion into ONE combined patch, using the intersection of the
+group's individual safe ranges (never wider than any member's own computed-
+safe range, so never less safe).
+
+**Round 3: V0 (contact) flush-alignment, one layer further down.** Even
+after rounds 1-2, `V1.M2.AUX.2` improved (48→43 on Block1) but
+`V0.M1.AUX.3` got worse by almost the exact same amount (37→42) - an
+almost-exact 1-for-1 trade, not a coincidence. Investigated visually in the
+KLayout GUI (several examples, both "corner" and "straight-edge" cases -
+screenshots confirmed the same mechanism every time): many of these V1 taps
+have a V0 contact sitting flush against the *default* M1 edge by design: our
+patch moving that edge away from its default position breaks the V0's flush
+alignment, which `V0.M1.AUX.3` requires (the identical "VX must exactly
+match the layer-below's width" rule family, one more layer down). Fixed by
+adding a THIRD independent safety constraint alongside the M2-merge-topology
+and foreign-M1 ones: `_v0_safe_range_for_via()` finds any V0 contact flush
+against the default edge in the direction growth is being considered, and
+simply refuses to grow that direction for that via if one exists (same
+treatment as hitting a foreign M1 obstacle with zero clearance) - cheaper
+and more robust than trying to "notch" the patch shape around each V0's
+footprint, and confirmed via real DRC re-run to eliminate the trade
+entirely: `V1.M2.AUX.2` 48→44, every other rule (including `V0.M1.AUX.3`)
+**exactly unchanged**, `check_connectivity.py` exact match (1350/1350 paths,
+0 mismatches).
+
+**Final architecture:** each via gets grown only as far as the
+*intersection* of three independently-computed safe ranges - what the M2
+merge topology allows, what nearby foreign M1 shapes (rectangular or not)
+allow with a spacing cushion, and what any flush-aligned V0 contact allows -
+never wider than any single one of them, and never narrower than the
+original default. Adjacent vias needing growth share one merged patch
+instead of colliding with each other. The row-wide pad itself is never
+touched.
+
+**Verified end-to-end through `agent.py`'s actual CLI entrypoint (not just
+direct function calls), real KLayout 0.30.1 + `evaluate_repair.py`, all 7
+available blocks (including Block4/Block5, released as this session's hidden
+test cases) - this is the final, shipped state:**
+
+| Case | Pristine floor (live) | Repaired `final_violation_rate` | `repair_rate` | `connectivity_preserved` |
+|---|---:|---:|---:|---|
+| Block1 | 1.2910 | **0.6311** | 0.6639 | true |
+| Block2 | 1.3235 | **0.5147** | 0.6765 | true |
+| Block3 | 1.2472 | **0.7191** | 0.5730 | true |
+| Block4 | 1.2857 | **0.5306** | 0.6803 | true |
+| Block5 | 1.2794 | **0.6471** | 0.5882 | true |
+| Block6 | 1.2996 | **0.6518** | 0.7287 | true |
+| Block7 | 1.2510 | **0.6431** | 0.6549 | true |
+
+Every case: `valid_repair: true`, `connectivity_preserved: true`. Every
+block improves over (or, for Block6, exactly matches - see below) the
+already-validated no-V1M2 state from the previous section - never a
+regression. One small known residual: Block6 shows a net-zero rule-level
+trade (`V1.M2.AUX.2` -2, `V1.M2.EN.2` +2, a DIFFERENT enclosure rule than
+`V0.M1.AUX.3`) - isolated to 2 instances in 1 block, not a connectivity
+issue, and not pursued further given the otherwise-clean result everywhere
+else.
 
 ## Fixes that didn't work (and why - important for future iterations)
 
@@ -487,12 +606,10 @@ before) instead of trading it for collateral damage.
   as reuse-sensitive as `VIA_VIA12` above; needs per-cell-family
   instance-count and per-instance-context checking before attempting.
   Deferred, not attempted.
-- `V1.M1.EN.1` / `V1.M2.AUX.2`: see the "`V1.M2.AUX.2` cascade" section above -
-  the mechanism and a working per-via safe-range computation are both built
-  (`apply_dynamic_v1m2_fix()`), but it's deliberately not called from
-  `main()` because it breaks connectivity (grows the M1 pad into unrelated
-  nearby M1 shapes never checked for safety). Needs an M1-side safe-range
-  check intersected with the existing M2-side one before it can ship.
+- `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
+  patches (v8)" above for the final, three-safety-constraint local-patch
+  fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
+  pre-existing violation on vias this fix doesn't touch), and remains open.
 - Spacing rules (`M1.S.2`, `M1.S.4`, `M2.S.7`, `M3.S.2`, `M4.S.5`) and 2 small
   new spacing violations introduced as a side effect of the M4/M5 fix
   (`M4.S.2`/`M4.S.3`, accepted as a net-positive tradeoff given the overall

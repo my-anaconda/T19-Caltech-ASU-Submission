@@ -7,7 +7,8 @@ that follows this submission.
 
 **Current status: a real, KLayout-validated repair, beating every one of
 T19's 10 prior agent attempts, generalized across every available block
-(Block1/2/3/6/7), not just the one it was originally derived on.** `agent.py`
+(Block1/2/3/4/5/6/7 - including Block4/Block5, released as this session's
+hidden test cases), not just the one it was originally derived on.** `agent.py`
 applies targeted geometric fixes across 3 DRC rule families (`V2.M3.AUX.2`,
 `V4.M5.AUX.2`, `V5.M6.AUX.2`) - via/landing-pad shapes in standard ASAP7 PDK
 library cells that are locally sized correctly but don't match the true
@@ -39,26 +40,37 @@ including a shift that looked clean in isolation but broke 4 other rules
 until its co-located pair was moved too.
 
 A further cascade (`V2.M3.AUX.2`'s fix can, in turn, require growing a
-nearby M1/M2 rail cell's V1 taps - `V1.M2.AUX.2`, one metal layer down) was
-investigated and a working per-via computation was built, but it is
-**deliberately not enabled**: real KLayout connectivity re-run showed it
-grows the M1 pad into *other, unrelated* M1 shapes never checked for safety,
-breaking connectivity. See NOTES.md's "`V1.M2.AUX.2` cascade" section for the
-full root-cause investigation and why it was reverted rather than shipped.
+nearby M1/M2 rail cell's V1 taps - `V1.M2.AUX.2`, one metal layer down) is
+also fixed, after three rounds of real-KLayout-validated refinement: growing
+the shared rail's M1 pad as one whole rectangle (spanning the entire row)
+broke connectivity outright by silently merging into unrelated standard-cell
+M1 shapes elsewhere in the row. The shipped version instead grows only the
+specific via that needs it, via a small **local** M1 patch, and checks THREE
+independent safety constraints before growing anything: the M2 merge
+topology, nearby foreign M1 shapes (including non-rectangular ones - real
+standard-cell M1 routing isn't always a simple rectangle), and any V0
+contact sitting flush against the default M1 edge (moving that edge away
+from a flush V0 breaks `V0.M1.AUX.3`, the same "must exactly match" rule
+family one layer further down - confirmed via KLayout GUI inspection).
+See NOTES.md's "`V1.M2.AUX.2` cascade, take 2: local patches" section for
+the full derivation, including two intermediate versions that were tried and
+found wanting via real KLayout DRC/connectivity re-runs each time.
 
-Verified end-to-end through this exact `agent.py`, real KLayout 0.30.1, real
-evaluator, against every available block, each compared to that block's own
-*true* pristine floor (a live KLayout re-run of the untouched script, not the
-naive `final_violation_rate = 1.0` assumption - see NOTES.md for why that
-assumption is wrong):
+Verified end-to-end through this exact `agent.py`'s actual CLI entrypoint,
+real KLayout 0.30.1, real evaluator, against every available block, each
+compared to that block's own *true* pristine floor (a live KLayout re-run of
+the untouched script, not the naive `final_violation_rate = 1.0` assumption -
+see NOTES.md for why that assumption is wrong):
 
 | Case | Pristine floor | Repaired | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.6475** | 0.664 | preserved |
-| Block2 | 1.3235 | **0.6176** | 0.677 | preserved |
-| Block3 | 1.2472 | **0.7640** | 0.573 | preserved |
+| Block1 | 1.2910 | **0.6311** | 0.664 | preserved |
+| Block2 | 1.3235 | **0.5147** | 0.677 | preserved |
+| Block3 | 1.2472 | **0.7191** | 0.573 | preserved |
+| Block4 | 1.2857 | **0.5306** | 0.680 | preserved |
+| Block5 | 1.2794 | **0.6471** | 0.588 | preserved |
 | Block6 | 1.2996 | **0.6518** | 0.729 | preserved |
-| Block7 | 1.2510 | **0.6576** | 0.655 | preserved |
+| Block7 | 1.2510 | **0.6431** | 0.655 | preserved |
 
 Every case: `valid_repair: true`, `connectivity_preserved: true`, and
 `final_violation_rate` genuinely below that block's own true pristine floor -
@@ -72,10 +84,9 @@ in isolation but broke 4 other rules once tried without moving its paired
 via cell too), the merge-aware per-via `V2.M3.AUX.2` fix and the
 non-rectangular-merge-region pitfall it had to handle, which similar-looking
 fixes were tried and failed (and why - a reused-cell-instance risk pattern
-that generalizes), and the `V1.M2.AUX.2` cascade that was built but not
-shipped (with the exact connectivity-breaking mechanism found via direct
-`pya.Region` probing) left for future iterations along with `V0.M1.AUX.3`
-and the remaining spacing rules.
+that generalizes), and the full three-round `V1.M2.AUX.2` local-patch
+derivation left for future iterations along with `V0.M1.AUX.3` (the
+remainder not tied to the V1.M2 cascade) and the remaining spacing rules.
 
 ## Layout
 
@@ -150,10 +161,10 @@ cat factors/t19-final/block/repair/Block1_factors.json
 ```
 
 Expect `valid_repair: true`, `connectivity_preserved: true`,
-`final_violation_rate: 0.6475409836065574`, `repair_rate: 0.6639344262295082`
+`final_violation_rate: 0.6311475409836066`, `repair_rate: 0.6639344262295082`
 for Block1 - confirmed by direct local testing (KLayout 0.30.1 via WSL),
 reproduced end-to-end through this exact `agent.py`. The same command with
-`--case Block2/Block3/Block6/Block7` reproduces the corresponding rows in the
-results table above. See `NOTES.md` for the full derivation of these fixes,
-why the naive floor isn't exactly `1.0`, and what's deferred to future
-iterations.
+`--case Block2/Block3/Block4/Block5/Block6/Block7` reproduces the
+corresponding rows in the results table above. See `NOTES.md` for the full
+derivation of these fixes, why the naive floor isn't exactly `1.0`, and what's
+deferred to future iterations.
