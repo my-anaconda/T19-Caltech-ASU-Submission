@@ -688,14 +688,54 @@ else.
      connectivity) - a genuine, hard geometric conflict, not a tuning
      problem.
 
-  **Conclusion**: the mechanism is fully understood (a via/contact losing
-  a purpose-built flush relationship when something else's metal merges in
-  - the same general family as the V1.M2.AUX.2 cascade), but every
+  **Conclusion (initial)**: the mechanism is fully understood (a via/contact
+  losing a purpose-built flush relationship when something else's metal
+  merges in - the same general family as the V1.M2.AUX.2 cascade), but every
   concretely-testable fix direction is blocked by a real, measured
   constraint - diffusion size, KLayout's shape-merging behavior, the
   absence of a movable top-level shape, or the connectivity gate itself.
-  Not pursued further; this is a genuine dead end, arrived at through
-  direct experiment at every step rather than assumption.
+
+  **Follow-up: a genuinely new, important distinction found - "shrink the
+  pad" is NOT the same risk as "shift the via".** Fix direction 4 above
+  (shifting `VIA_VIA12`'s whole placement) broke connectivity. Tested a
+  different variant of the SAME cell-uniquification technique: clone
+  `VIA_VIA12` into a new cell for just this one instance (exactly this
+  agent's existing custom-cell architecture, not a new mechanism), but only
+  reshape its M1 PAD - never move the via (V1 layer) itself. Three pad
+  shapes were tried, each verified with a real DRC + `check_connectivity.py`
+  re-run:
+
+  | Pad variant | `V0.M1.AUX.3` | `V1.M1.EN.1` | New violations | Connectivity |
+  |---|---|---|---|---|
+  | Shrink (cap top at the notch line) | 37->36 (fixed) | 11->12 (worse) | `V1.AUX.1` +1 (part of the via now uncovered) | **preserved** |
+  | Widen (match the notch's own width) | 37 (unchanged) | 11 (unchanged) | none | preserved |
+  | Stepped (edge aimed at V0's exact corner) | 37 (unchanged) | 11 (unchanged) | none | preserved |
+
+  The critical finding: **`check_connectivity.py` only cares about the via's
+  actual position/overlap with the correct net - not full DRC enclosure.**
+  Reshaping the pad (while leaving the via itself exactly where it is) never
+  broke connectivity in any of the three variants, even the one that
+  exposed part of the via. This is a real, useful, previously-unproven
+  distinction for any future work on this cell.
+
+  However, precisely engineering a pad shape that both fixes
+  `V0.M1.AUX.3` AND avoids new collateral (`V1.M1.EN.1`, `V1.AUX.1`) proved
+  harder than expected - the "stepped, aimed at V0's exact corner" attempt
+  was hand-derived from tracing BUFx2's notched polygon vertices by hand,
+  and still didn't land the intended coincident edge once actually merged
+  with the full local topology (verified via the same edge-by-edge `pya`
+  check used earlier - the edge still wasn't coincident, meaning some
+  additional shape in the true local merge wasn't accounted for by hand).
+  Three attempts, three misses on the "fix without collateral" goal.
+
+  **Conclusion**: doing this safely and correctly - for this instance, let
+  alone generalizing across the other 36 - needs a proper per-instance
+  shape-solver (compute the exact safe pad shape programmatically from the
+  true local merge topology, the same rigor as `_safe_y_range_for_x_range`
+  built for V1.M2.AUX.2) rather than hand-designed candidate polygons, which
+  have now failed three times in a row on the same single instance. Not
+  pursued further this session; flagged as a well-understood, promising,
+  but nontrivial follow-up for whoever picks this up next.
 - `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
