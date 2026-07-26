@@ -907,3 +907,62 @@ agents should "prioritize preserving a runnable KLayout script and the
 provided connectivity reference before optimizing DRC violation counts" -
 i.e. a valid, connectivity-preserving script with a modest repair rate beats
 an invalid or connectivity-broken one, regardless of token cost.
+
+## OpenROAD legalizer track: "rip up and reroute" (setup done, integration not started)
+
+Idea (from earlier discussion): rather than only patching individual via/pad
+shapes in place, use OpenROAD's real detailed-placement legalizer to move
+offending standard cells to legal, DRC-clean positions with minimal
+displacement, then re-stitch routing - a fundamentally different, more
+powerful approach than this repo's current per-rule geometric patches. This
+section records what's confirmed ready vs. what's still unbuilt.
+
+**Confirmed working (2026-07-26):**
+- `docker pull openroad/orfs:latest` (OpenROAD Flow Scripts, image digest
+  `sha256:3bc303869d5e4caac8f72c854f2b1614c726b2961bbb372f54bc8fbc0e725e71`,
+  6.48GB) - chosen specifically because ORFS bundles ASAP7 as one of its own
+  reference platforms, confirmed via the upstream repo before pulling.
+- `openroad` binary works inside the container after `source
+  /OpenROAD-flow-scripts/env.sh` (not on PATH by default) - version
+  `26Q3-771-g7cfb2105c9`.
+- Real ASAP7 PDK files are bundled at `/OpenROAD-flow-scripts/flow/platforms/asap7/`:
+  `lef/` (tech LEF variants `asap7sc7p5t_28_{L,R,SL}_1x_220121a.lef` plus
+  per-cell LEFs for DFFs/SRAM/regfile macros), `lib/` (Liberty timing),
+  `gds/`, `KLayout/` (tech files), `drc/`. Verified
+  `asap7sc7p5t_28_SL_1x_220121a.lef` alone contains 212 real standard-cell
+  `MACRO` entries (`AND2x2_ASAP7_75t_SL`, etc.) - this is a genuine,
+  complete standard-cell LEF, not just memory/DFF macros.
+
+**Not yet started - the actual integration gap:** our ASU testcase data
+(`testcase/asap7/`) is purely KLayout-native (GDS + `.lydrc`/`.lyp`, produced
+by `pya`-based layout scripts) - there is no LEF/DEF anywhere in the
+provided testcase. OpenROAD's `detailed_placement` legalizer
+(`dpl`/OpenDP - see
+https://openroad.readthedocs.io/en/latest/main/src/dpl/README.html) operates
+on a LEF+DEF design database, not GDS directly. The still-unbuilt bridge:
+
+1. Extract current instance placement (name, cell type, x/y, orientation)
+   from a block's generated GDS - probably via `pya`'s
+   `top.each_inst()` on the block's own output GDS, not by re-parsing the
+   Python layout script.
+2. Emit a DEF (or build the design directly via OpenROAD's `odb` Python
+   API, skipping a DEF round-trip) using the real ASAP7 LEF cell names
+   above, in the ASAP7 tech LEF's DBU/site/row convention.
+3. Run `detailed_placement -max_displacement <disp>` (start with a small
+   cap - these blocks are small, and large displacement would require
+   re-routing far more than the immediate local nets) against the loaded
+   ASAP7 LEF, then `check_placement` to confirm legality.
+4. Read back legalized positions, diff against step 1's original positions,
+   and apply that per-instance delta to the block's own KLayout Python
+   script (keeping it as a runnable klayout script, per `AGENT_GUIDE.md`'s
+   priority - not replacing it with raw DEF/LEF output).
+5. **Hardest unsolved part**: any wire/via touching a moved cell needs
+   re-stitching. Full re-route via OpenROAD's global+detailed router would
+   need the whole design (not just placement) translated into LEF/DEF
+   including routing layers - a much bigger lift than steps 1-4. A cheaper
+   alternative worth trying first: only re-stitch the local nets touching
+   cells that actually moved, leaving untouched routing alone.
+
+Next session: prototype steps 1-3 against one real block (e.g. Block1) to
+confirm `detailed_placement` actually runs and produces a legal result
+before investing in steps 4-5.
