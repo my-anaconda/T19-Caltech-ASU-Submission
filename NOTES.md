@@ -759,19 +759,41 @@ else.
   | Has genuine slack (some other material already covers the zone) | 0 |
   | Ambiguous (different local structure, not the same simple pattern) | 2 |
 
-  **Conclusion**: this is not one hard instance - it's essentially the
-  whole bucket. 35 of 37 (95%) are provably geometrically infeasible by
-  the identical mechanism, with zero found to have exploitable slack for a
-  pad-reshaping fix. A per-instance shape-solver would have nothing to
-  solve for the 35 - the answer for each is already proven "no legal pad
-  shape exists, full stop," not "not yet found." The remaining 2 ambiguous
-  cases are the only theoretically open thread, and would need their own
-  individual investigation (different local geometry the simple top/bottom
-  coincidence check didn't cleanly categorize) - a small enough number that
-  it's not worth building general solver tooling for. `V0.M1.AUX.3` is now
-  closed out for this session: mechanism fully understood, fix directions
-  exhaustively tested, and the negative result is proven rather than
-  assumed.
+  **Verification pass (important given how many hand-computation mistakes
+  happened earlier in this same investigation - bbox-vs-true-polygon
+  confusion, backwards branch conditions, a shadowed-variable bug that
+  silently produced an empty test GDS).** Before trusting the 35/0/2
+  result, it was checked two more ways:
+  1. *Independent re-derivation, not just re-running the same script.* For
+     a spread-sampled subset, listed every cell with ANY M1 shape merely
+     *touching* (bbox-level) the forced zone, then computed each one's
+     TRUE polygon overlap with the zone directly (`shape.polygon`, not
+     bbox). Confirmed e.g. `INVx3_ASAP7_75t_R`'s shape bbox touches a forced
+     zone but its true polygon contributes exactly 0 overlap there, while
+     `VIA_VIA12` alone contributes the full area - matching the subtraction
+     computation exactly, via a completely different code path.
+  2. *The 2 "ambiguous" cases were re-examined rather than left as a loose
+     end.* Both turned out to have neither top nor bottom edge coincident -
+     because their flush edge is on the RIGHT instead (the original check
+     only tested the vertical axis). Re-running the identical
+     coverage-feasibility logic on the horizontal axis for both: **zero**
+     coverage from anything else in both cases too - same mechanism, same
+     conclusion, just oriented sideways.
+
+  **Final, verified conclusion: all 37 of 37 violations in Block1 are
+  provably geometrically infeasible** by the identical mechanism (`VIA_VIA12`'s
+  own via body requires M1 coverage on the far side of a standard-cell
+  notch line, and literally nothing else in the design covers that specific
+  area - confirmed via true-polygon overlap, not bounding boxes, and
+  cross-checked by two independent computations). Zero found with
+  exploitable slack. A per-instance shape-solver would have nothing to
+  solve - every instance's answer is already proven "no legal pad shape
+  exists," not "not yet found." `V0.M1.AUX.3` is closed out for this
+  session with high confidence: mechanism understood, fix directions
+  exhaustively tested, and the negative result independently
+  double-checked after multiple earlier mistakes in the same
+  investigation - not taken on faith from the first script that produced
+  it.
 - `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
