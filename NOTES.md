@@ -728,14 +728,33 @@ else.
   additional shape in the true local merge wasn't accounted for by hand).
   Three attempts, three misses on the "fix without collateral" goal.
 
-  **Conclusion**: doing this safely and correctly - for this instance, let
-  alone generalizing across the other 36 - needs a proper per-instance
-  shape-solver (compute the exact safe pad shape programmatically from the
-  true local merge topology, the same rigor as `_safe_y_range_for_x_range`
-  built for V1.M2.AUX.2) rather than hand-designed candidate polygons, which
-  have now failed three times in a row on the same single instance. Not
-  pursued further this session; flagged as a well-understood, promising,
-  but nontrivial follow-up for whoever picks this up next.
+  **Final proof of infeasibility (this instance), via boolean region check
+  rather than more hand-designed shapes.** Reframed as a feasibility test:
+  does ANYTHING other than `VIA_VIA12`'s own pad cover the via's own
+  physical footprint in the region above the notch line (abs Y>2340, the
+  via's own X-span 6480-6552)? Computed directly via `pya.Region` boolean
+  subtraction (true polygons, not bounding boxes - an earlier pass at this
+  exact check used bboxes and wrongly suggested full coverage, corrected
+  once redone with the real notched polygons): **zero** - nothing else in
+  the design covers that area at all. The via must be covered by *some* M1
+  (a bare physical requirement, not a tunable margin), and only
+  `VIA_VIA12`'s own pad provides it there. This means **any** legal pad
+  shape - however cleverly stepped - necessarily extends past the notch
+  line, because the via's own unmovable body straddles it. This is a
+  proven geometric impossibility for this instance, not a shape not yet
+  found: as long as the via stays where connectivity requires it, no pad
+  shape can simultaneously (a) fully cover the via and (b) avoid erasing
+  the notch edge V0.M1.AUX.3 depends on.
+
+  **Conclusion**: confirmed dead end for this instance via direct proof,
+  not just repeated failed attempts. The same boolean-coverage check could
+  be run per-instance to confirm (or, in principle, occasionally refute)
+  this for the other 36, but the underlying mechanism - the same `VIA_VIA12`
+  cell's same internal geometry landing on the same kind of standard-cell
+  notch - makes it likely structural across most/all of them. Building a
+  general per-instance shape-solver only makes sense for instances where
+  this coverage check comes back non-empty (i.e. where slack genuinely
+  exists) - worth checking BEFORE building solver tooling, not after.
 - `V1.M2.AUX.2`: **shipped** - see "`V1.M2.AUX.2` cascade, take 2: local
   patches (v8)" above for the final, three-safety-constraint local-patch
   fix. `V1.M1.EN.1` itself is still not directly targeted (it's a
