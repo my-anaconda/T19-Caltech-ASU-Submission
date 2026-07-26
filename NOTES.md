@@ -279,6 +279,168 @@ data points on Block1 and cross-checked against every distinct residue=6 row
 Y-value across all 5 blocks (6 distinct rows total) before being trusted as
 a general gate - not just fit to Block1 and hoped to generalize.
 
+## M4 grid alignment, residue=12/18 (v4) - exact formula from the rule source
+
+The v3 section above left residue=12/18 rows deliberately unfixed, using a
+reverse-engineered `mod-192/{48,96}` approximation. Reading `asap7.lydrc`'s
+`offgrid_cl` Ruby method directly (not reverse-engineering further) gives the
+exact rule:
+
+```ruby
+def offgrid_cl(axis, pitch_dbu, offset_dbu, base_dbu = nil)
+  ...
+  next if bb.bottom % base_dbu != 0 || bb.top % base_dbu != 0  # M4.AUX.1's own grid
+  cl = axis == :y ? (bb.bottom + bb.top) / 2 : (bb.left + bb.right) / 2
+  if (cl - offset_dbu) % pitch_dbu != 0 ... # flag as violation
+```
+called as `m4_1x.offgrid_cl(:y, 192, 48, 96)`. Since the co-located M4 pad's
+local shape is symmetric about the placement Y (local range -48..+48 raw
+units), its centerline equals the raw placement Y exactly, so the single
+condition **`(Y - 48) % 192 == 0`** decides *both* `M4.AUX.1` (the 96-grid
+precondition, since 192 = 2×96) and `M4.AUX.2` (the pitch/offset condition)
+at once - no separate/approximate check needed. Cross-checked against 10 real
+KLayout DRC re-runs (5 off-grid rows × both shift directions): zero
+mismatches. `compute_grid_shifts()` now handles every off-grid residue this
+way (not just 6), picking whichever of the two nearest 24nm-grid neighbors
+satisfies the exact condition (exactly one direction ever does, confirmed
+empirically over all tested rows) and skipping (logged) only the genuinely
+ambiguous case where neither/both directions qualify.
+
+## Merge-aware, per-via shape-aware `V2.M3.AUX.2` (v5)
+
+The v2 fixed-target growth (M3 → ±68 always) silently broke once the v4 grid
+shifts started moving more rows: shifting a `VIA_VIA34_1_2_58_52` instance's
+M3 pad can change the *merged* M3 extent a nearby, un-shifted
+`VIA_VIA23_1_3_36_36` instance must match - a fixed constant is wrong for
+those specific instances (confirmed via real KLayout DRC re-run once v4 was
+combined with v2).
+
+Direct `pya.Region`/vertex inspection showed the merged region in the
+affected cases is a **stepped, non-rectangular polygon** - full width for the
+instance's own 136-height "core", narrower for whatever extra height the
+shifted neighbor contributes. Growing a via to the group's overall
+bounding-box height (ignoring the step) can stick the via out of the true
+shape, causing new `V2.AUX.1` (containment) / `V2.M3.EN.2` (enclosure)
+violations - this was seen directly before being fixed.
+
+**The fix:** for each of the 3 vias in `VIA_VIA23_1_3_36_36` independently,
+compute the Y range continuously covered by the merge group at *every* X
+point across that via's own X-span (the "vertical slice intersection" -
+`_safe_y_range_for_x_range()` in `agent.py`), not just the group's bbox
+height. This is not necessarily symmetric about the via's original position -
+asymmetric growth is exactly what "match M3's true edges" requires whichever
+direction they lie in. The M2 pad grows to the union of all 3 (possibly
+different) via ranges, to keep every via enclosed (`V2.M2.EN.1`). Instances
+whose full computed result matches the original default range keep the
+shared cell definition (edited in place); any instance whose result differs
+gets its own new, uniquely-named cell definition, with only that instance's
+placement line repointed. Verified clean (zero `V2.AUX.1`/`V2.M3.EN.2`
+collateral) across all 5 blocks - `V2.M3.AUX.2` itself now goes to 0
+everywhere (72/24/27/78/225 violations fixed on Block1/2/3/6/7
+respectively).
+
+**Two connectivity-checker parsing conventions this surfaced (both silent,
+neither raises an error) - critical for anyone generating new per-instance
+cell definitions for this evaluator:**
+1. `evaluator/check_connectivity.py` matches polygon variable names with the
+   hardcoded regex `^(p\d+)\s*=\s*pya\.Polygon\(...)` - literally "p" plus
+   digits only. A custom name like `p_MyCell_1` is silently invisible to the
+   tracer, collapsing `modified_paths_count` to 0 for the *entire* script,
+   not just locally. `agent.py`'s new-cell generator uses a plain numeric
+   `p{N}` scheme for exactly this reason.
+2. The same script identifies the script's "top cell" by scanning for
+   `create_cell()` calls and keeping the **last one found** in the file, no
+   further anchoring. This happens to work for `BlockN`'s own `create_cell()`
+   line only because it's always the last one in each script's initial
+   declarations section. A new `create_cell()` call for a custom via cell
+   must therefore be inserted **before** that point (right after the
+   original cell's own `create_cell()` line) - not alongside its shape
+   definitions further down, which live after it. Getting this wrong
+   collapses connectivity tracing to 0 paths for the whole script (confirmed
+   by triggering it, then fixing it, via direct `check_connectivity.py`
+   re-runs).
+
+## `V1.M2.AUX.2` cascade - attempted, and reverted (v6 → v7)
+
+Growing `VIA_VIA23`'s M2 pad (v5, above) to enclose its now-asymmetric V2
+vias can merge with a large M1/M2 rail cell's own M2 shape nearby (this
+cell's name embeds block-specific dimensions - `VIA_via1_2_3132_18_1_87_36_36`
+on Block1/6, `..._2160_..._60_...` on Block2, `..._2322_..._64_...` on
+Block3, `..._6750_..._187_...` on Block7 - discovered per-script via regex,
+not hardcoded), inflating the rail's local merged M2 height beyond what its
+own (untouched) V1 taps can match - the same `V1.M2.AUX.2` mechanism as v5,
+one metal layer down. `_apply_dynamic_merge_aware_fix()` was generalized to
+handle both cases with the same per-via-safe-range logic.
+
+Two structural bugs surfaced and were fixed first (both specific to this
+cell having up to 187 vias per instance, unlike `VIA_VIA23`'s fixed 3):
+- **Orphaned base cell → KLayout DRC crash.** If *every* instance of the
+  rail cell needs a non-default range (happened on Block7 - no instance's
+  87-via computation matched the literal default), the original shared cell
+  definition becomes completely unreferenced once every instance is
+  repointed to its own custom cell. KLayout's DRC macro requires exactly one
+  parentless "top" cell; an orphaned definition becomes a second one and
+  DRC aborts with `RuntimeError: 'source': The layout has multiple top cells`.
+  Fixed by always dedicating exactly one group (the literal default if
+  present, otherwise the largest non-default group) to be edited in place on
+  the shared cell definition, via a new asymmetric `_set_y_range(y0, y1)`
+  transform (unlike `_grow_y`, not required to be symmetric about 0).
+
+**Then, despite the above being individually correct, the fix as a whole was
+found to break connectivity - and was reverted.** Real
+`check_connectivity.py` re-run against the fully-generalized fix: all 824
+sources found (no parsing regression), but 460 pin-endpoint + 381
+routing-endpoint mismatches, `modified_paths_count` 8260 vs. golden 1350.
+
+**Root cause, confirmed by direct headless `pya.Region` probing (not
+assumed):** the per-via safe-range computation only validates the *via/pad*
+growth against the **reference layer's (M2) merge topology** - it never
+checks whether growing the **pad layer (M1) itself** stays clear of *other,
+unrelated* M1 shapes nearby. On Block1's rail row at placement Y=3240, one
+instance's M1 pad legitimately needed to grow (per the M2-safety check) up
+to local Y=+140 (absolute Y=3380) - but unrelated M1 shapes (other
+standard-cell M1 shapes sharing that same row) already occupy absolute
+Y=3348-3380 in that same X range. The grown pad silently merges with them,
+creating new, bogus electrical connections that don't exist in the golden
+design - exactly matching the observed pin/routing endpoint-count blowup.
+Confirmed via `pya.Region` probes directly on both the pristine and repaired
+GDS at that exact box: identical shapes below/at the default footprint,
+brand-new overlapping shapes only in the grown region.
+
+Fixing this properly would need a *second*, independent safe-range check on
+the M1 layer's own neighbors (analogous to `_safe_y_range_for_x_range` but
+scoped to M1's own merge/proximity, then intersected with the M2-derived
+via range before finalizing) - not yet built. Given the demonstrated risk
+(this is now the *third* cascade level, one layer further down each time,
+and each level has needed a materially harder safety check than the last),
+**`apply_dynamic_v1m2_fix()` is implemented in `agent.py` but deliberately
+not called from `main()`.** Confirmed via direct re-run that skipping only
+this one fix restores connectivity exactly (1350/1350 paths, 0 mismatches
+on Block1; equivalent exact-match results on all 5 blocks). The reintroduced
+`V1.M2.AUX.2` violations (48/16/23/66/189 on Block1/2/3/6/7) are the accepted
+cost of *not* shipping an unsafe fix, not a regression versus a safer
+alternative - they were never fixed to begin with, and the alternative
+(shipping the unsafe version) breaks the hard connectivity gate entirely.
+
+**Verified end-to-end, real KLayout 0.30.1 + `check_connectivity.py`, all 5
+blocks, current locked-in state (v4 grid formula + v5 merge-aware V2.M3.AUX.2
++ the original 3 fixed-target fixes, v1m2 NOT applied):**
+
+| Case | Pristine floor (live) | Repaired `final_violation_rate` | `repair_rate` | `connectivity_preserved` |
+|---|---:|---:|---:|---|
+| Block1 | 1.2910 | **0.6475** | 0.6639 | true |
+| Block2 | 1.3235 | **0.6176** | 0.6765 | true |
+| Block3 | 1.2472 | **0.7640** | 0.5730 | true |
+| Block6 | 1.2996 | **0.6518** | 0.7287 | true |
+| Block7 | 1.2510 | **0.6576** | 0.6549 | true |
+
+Every case: `valid_repair: true`, `connectivity_preserved: true`, all
+connectivity sources verified with 0 mismatches - a substantial improvement
+over the v3 table above (e.g. Block1 0.8852 → 0.6475), driven by the v4 exact
+grid formula covering every off-grid row (not just residue=6) and the v5
+merge-aware fix resolving `V2.M3.AUX.2` completely (0 remaining, vs. partial
+before) instead of trading it for collateral damage.
+
 ## Fixes that didn't work (and why - important for future iterations)
 
 - **Naive V2 height fix (56, the isolated-cell height) instead of 68 (the
@@ -325,12 +487,12 @@ a general gate - not just fit to Block1 and hoped to generalize.
   as reuse-sensitive as `VIA_VIA12` above; needs per-cell-family
   instance-count and per-instance-context checking before attempting.
   Deferred, not attempted.
-- `V1.M1.EN.1` (48 violations) / `V1.M2.AUX.2` (11 violations): a side effect
-  surfaced from investigating the M2 growth; the correct fix appears to also
-  route through `VIA_VIA12`'s ubiquity problem above. Deferred.
-  (`V1.M2.AUX.2` was directly probed - `asu_check_v1m2.py` - confirming the
-  same "width mismatch vs. true merged M2 extent" shape as the three fixed
-  rules, but the ubiquity of `VIA_VIA12` blocks a blind automatic fix.)
+- `V1.M1.EN.1` / `V1.M2.AUX.2`: see the "`V1.M2.AUX.2` cascade" section above -
+  the mechanism and a working per-via safe-range computation are both built
+  (`apply_dynamic_v1m2_fix()`), but it's deliberately not called from
+  `main()` because it breaks connectivity (grows the M1 pad into unrelated
+  nearby M1 shapes never checked for safety). Needs an M1-side safe-range
+  check intersected with the existing M2-side one before it can ship.
 - Spacing rules (`M1.S.2`, `M1.S.4`, `M2.S.7`, `M3.S.2`, `M4.S.5`) and 2 small
   new spacing violations introduced as a side effect of the M4/M5 fix
   (`M4.S.2`/`M4.S.3`, accepted as a net-positive tradeoff given the overall

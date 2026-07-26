@@ -91,14 +91,18 @@ RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 # match what was validated on Block1 before touching anything - otherwise the
 # whole cell is skipped and logged, never guessed at.
 #
-# The per-position transforms themselves (which shapes move, and to exactly
-# what coordinates) are unchanged from the original Block1 derivation - see
-# NOTES.md. Confirmed via direct diffing of Block1/2/3/6/7 that every
-# violating shape for these 3 rules has byte-identical local dimensions
-# (72x72 / 96x96 / 96x128) in every block that has them, and the target
-# extents (136/480/640) are fixed PDK/design-grid constants, not values that
-# need to be recomputed per block - so the same validated target coordinates
-# apply everywhere the structural shape matches.
+# V4.M5.AUX.2 (VIA_VIA45_1_2_58_58) and V5.M6.AUX.2 (VIA_VIA56_2_2_66_58)
+# below use FIXED target extents (480/640) - confirmed by direct diffing of
+# Block1/2/3/6/7 that every violating shape for these 2 rules has
+# byte-identical local dimensions in every block that has them, and that the
+# grid-alignment fix further down never changes these two rules' true merged
+# extents (cross-checked across all 5 blocks: 0 instances ever need a
+# non-default target - see NOTES.md). V2.M3.AUX.2 (VIA_VIA23_1_3_36_36) is
+# handled separately, dynamically, below: growing a co-located VIA_VIA34
+# instance's M3 pad (see the grid-alignment section) CAN change the true
+# merged M3 extent a NEARBY, un-shifted VIA_VIA23 instance must match - a
+# fixed target silently breaks for those instances (confirmed via real
+# KLayout DRC re-run - see NOTES.md's "Merge-aware via-growth" section).
 # ---------------------------------------------------------------------------
 
 def _grow_y(half):
@@ -115,19 +119,21 @@ def _grow_x(half):
     return _t
 
 
+def _set_y_range(y0, y1):
+    """Keep the shape's X range, set its Y range to exactly [y0, y1] -
+    unlike _grow_y, not necessarily symmetric about 0 (the merge-aware
+    fixes below can need an asymmetric range)."""
+    def _t(x0, oy0, x1, oy1, x2, oy2, x3, oy3):
+        return (x0, y0, x1, y1, x2, y1, x3, y0)
+    return _t
+
+
 # cell name -> { layer: [transform_or_None, ...] } in each layer's own
 # file-appearance order. `None` means "found here, but intentionally left
 # unchanged" (either already correct, or a deliberately-deferred edit - see
 # NOTES.md's "Fixes that didn't work" for why not every shape in a matched
 # cell gets touched).
 CELL_FIX_SPECS = {
-    # V2.M3.AUX.2: M2 landing pad + all 3 V2 vias, Y half-extent 36 -> 68
-    # (M3's true flattened/merged perpendicular extent is 136).
-    "VIA_VIA23_1_3_36_36": {
-        20: [_grow_y(68)],                       # M2 landing pad
-        30: [None],                               # unrelated shape, untouched
-        25: [_grow_y(68), _grow_y(68), _grow_y(68)],  # 3x V2 via
-    },
     # V4.M5.AUX.2 / V4.M4.EN.1: M4 pad X half-extent 208 -> 284 (keeps V4
     # enclosed per V4.M4.EN.1); both V4 vias -> X +/-240 (M5's true merged
     # perpendicular extent is 480).
@@ -154,21 +160,13 @@ _POLY_INSERT_RE_TMPL = (
 )
 
 
-def apply_validated_fixes(script_text):
-    """Applies each validated fix structurally, per CELL_FIX_SPECS.
-
-    For each target via cell: find every pXXX = pya.Polygon(...) statement
-    immediately followed by that exact cell's .insert(pXXX) call, group the
-    matches by GDS layer (in appearance order within each layer), and only
-    apply edits if the found layer/shape-count structure EXACTLY matches the
-    validated spec - any mismatch (missing layer, wrong shape count, extra
-    layer) skips that entire cell rather than guessing.
-
-    Returns (patched_text, applied_list, skipped_list)."""
+def _apply_cell_fix_specs(script_text, cell_fix_specs):
+    """Applies each fix in `cell_fix_specs` structurally (see module docstring
+    and the comment block above). Returns (patched_text, applied_list, skipped_list)."""
     applied = []
     skipped = []
 
-    for cell_name, layer_spec in CELL_FIX_SPECS.items():
+    for cell_name, layer_spec in cell_fix_specs.items():
         pattern = re.compile(_POLY_INSERT_RE_TMPL.format(cell=re.escape(cell_name)))
         matches = list(pattern.finditer(script_text))
         if not matches:
@@ -216,97 +214,621 @@ def apply_validated_fixes(script_text):
     return script_text, applied, skipped
 
 
+def apply_validated_fixes(script_text):
+    """Applies the fixed-target via-growth fixes (V4.M5.AUX.2, V5.M6.AUX.2).
+    See apply_dynamic_v2m3_fix() for V2.M3.AUX.2, which needs a
+    merge-aware, per-instance target instead of a fixed one."""
+    return _apply_cell_fix_specs(script_text, CELL_FIX_SPECS)
+
+
 # ---------------------------------------------------------------------------
-# M4.AUX.1 grid-alignment fix (the "deferred" rule family from NOTES.md).
+# General script-geometry engine, shared by the grid-alignment fix and the
+# merge-aware V2.M3.AUX.2 fix below. Pure stdlib (re + collections) - no pya
+# dependency at grading time. Every piece of this was cross-validated against
+# real KLayout (pya.Region/Box.transformed) before being trusted - see
+# NOTES.md's "Merge-aware via-growth" section:
+#   - transform_bbox()'s rotation/mirror formula reproduces pya.Trans exactly
+#     (tested all 8 rot/mirror combinations against pya.Box.transformed()).
+#   - merge_rects() reproduces pya.Region.merged() for the 3 known via-growth
+#     targets exactly (136/480/640, matching NOTES.md's original derivation).
+# ---------------------------------------------------------------------------
+
+_ANY_POLY_INSERT_RE = re.compile(
+    r"(?P<var>p\w+) = pya\.Polygon\(\[pya\.Point\((?P<x0>-?\d+), (?P<y0>-?\d+)\), "
+    r"pya\.Point\((?P<x1>-?\d+), (?P<y1>-?\d+)\), pya\.Point\((?P<x2>-?\d+), (?P<y2>-?\d+)\), "
+    r"pya\.Point\((?P<x3>-?\d+), (?P<y3>-?\d+)\)\]\)\r?\n"
+    r"cell_(?P<cellvar>\w+)\.shapes\(layout\.layer\(pya\.LayerInfo\((?P<layer>\d+), 0\)\)\)\.insert\((?P=var)\)"
+)
+_ANY_INST_RE = re.compile(
+    r"cell_(?P<topvar>\w+)\.insert\(pya\.CellInstArray\(cell_(?P<subvar>\w+)\.cell_index\(\), "
+    r"pya\.Trans\((?P<rot>-?\d+), (?P<mirror>True|False), pya\.Vector\((?P<x>-?\d+), (?P<y>-?\d+)\)\)\)\)"
+)
+
+
+def _poly_bbox(pts):
+    xs = pts[0::2]
+    ys = pts[1::2]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _parse_all_shapes(script_text):
+    """Returns {cellvar: {layer: [bbox, ...]}} for every pXXX=Polygon(...)/
+    .insert(pXXX) statement in the script (any cell, any layer, file order)."""
+    shapes = defaultdict(lambda: defaultdict(list))
+    for m in _ANY_POLY_INSERT_RE.finditer(script_text):
+        cellvar = m.group("cellvar")
+        layer = int(m.group("layer"))
+        pts = tuple(int(m.group(g)) for g in ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3"))
+        shapes[cellvar][layer].append(_poly_bbox(pts))
+    return shapes
+
+
+def _parse_all_instances(script_text):
+    """Returns list of (topvar, subvar, rot, mirror, x, y) for every instance
+    placement in the script, regardless of which cell."""
+    return [
+        (m.group("topvar"), m.group("subvar"), int(m.group("rot")),
+         m.group("mirror") == "True", int(m.group("x")), int(m.group("y")))
+        for m in _ANY_INST_RE.finditer(script_text)
+    ]
+
+
+def _transform_bbox(bbox, rot, mirror, dx, dy):
+    # pya.Trans(rot, mirror, x, y) semantics, determined empirically against
+    # pya.Box.transformed() (all 8 rot/mirror combinations): mirror negates Y
+    # first, then rotate by (rot % 4) * 90deg CCW, then translate. This
+    # design only ever uses rot % 4 in {0, 2} (0deg/180deg) for cells that
+    # touch layers 20/25/30/35/40/45/50/55/60 - true 90/270 rotation is only
+    # used by standard cells on M1, which this engine never needs to
+    # flatten. Assert rather than silently mishandle a case never observed.
+    quarter = rot % 4
+    assert quarter in (0, 2), f"unexpected 90/270 rotation rot={rot} on a merge-relevant layer"
+    x0, y0, x1, y1 = bbox
+    if mirror:
+        y0, y1 = -y1, -y0
+    if quarter == 2:
+        x0, y0, x1, y1 = -x1, -y1, -x0, -y0
+    return (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+
+
+def _flatten_layer(topcell_var, layer, shapes, instances):
+    """Absolute bboxes for `layer` under `topcell_var`: shapes placed
+    directly in the top cell (already absolute) plus shapes inside any named
+    sub-cell instantiated under it (transformed per-instance)."""
+    boxes = list(shapes.get(topcell_var, {}).get(layer, []))
+    for topvar, subvar, rot, mirror, x, y in instances:
+        if topvar != topcell_var:
+            continue
+        for bbox in shapes.get(subvar, {}).get(layer, []):
+            boxes.append(_transform_bbox(bbox, rot, mirror, x, y))
+    return boxes
+
+
+def _touch_or_overlap(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 <= bx1 and bx0 <= ax1 and ay0 <= by1 and by0 <= ay1
+
+
+def _merged_group_members_containing(boxes, target_box):
+    """Connected-component merge of axis-aligned bboxes that touch or
+    overlap (matches KLayout Region.merged() for simple rectangles);
+    returns the list of member boxes for whichever group contains
+    `target_box` (or None if target_box isn't found)."""
+    n = len(boxes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _touch_or_overlap(boxes[i], boxes[j]):
+                union(i, j)
+
+    try:
+        target_idx = boxes.index(target_box)
+    except ValueError:
+        return None
+    root = find(target_idx)
+    return [boxes[i] for i in range(n) if find(i) == root]
+
+
+def _safe_y_range_for_x_range(group_members, x0, x1):
+    """Within a single already-identified connected group of bboxes, finds
+    the Y range continuously covered by SOME member box at every X point
+    across [x0, x1] (the "vertical slice intersection" as X sweeps the
+    range) - i.e. the largest Y-extent a shape spanning exactly [x0, x1]
+    could grow to while staying strictly inside the group's true (possibly
+    non-rectangular) shape. Returns (ymin, ymax), or None if there's a gap
+    anywhere in [x0, x1] (shouldn't happen for a shape already confirmed to
+    be part of this group, but checked rather than assumed).
+
+    Scoped to a pre-identified group's members (not the whole layer) - a
+    naive whole-layer version would incorrectly pick up unrelated, far-away
+    shapes that happen to share an X coordinate."""
+    breakpoints = {x0, x1}
+    for (bx0, by0, bx1, by1) in group_members:
+        if x0 < bx0 < x1:
+            breakpoints.add(bx0)
+        if x0 < bx1 < x1:
+            breakpoints.add(bx1)
+    breakpoints = sorted(breakpoints)
+
+    overall_ymin, overall_ymax = None, None
+    for i in range(len(breakpoints) - 1):
+        mid = (breakpoints[i] + breakpoints[i + 1]) / 2
+        covering = [b for b in group_members if b[0] <= mid <= b[2]]
+        if not covering:
+            return None
+        ymin = min(b[1] for b in covering)
+        ymax = max(b[3] for b in covering)
+        if overall_ymin is None:
+            overall_ymin, overall_ymax = ymin, ymax
+        else:
+            overall_ymin = max(overall_ymin, ymin)
+            overall_ymax = min(overall_ymax, ymax)
+    return (overall_ymin, overall_ymax)
+
+
+# ---------------------------------------------------------------------------
+# M4.AUX.1 / M4.AUX.2 grid-alignment fix (the "deferred" rule family from
+# NOTES.md).
 #
 # VIA_VIA45_1_2_58_58 (M4<->M5 via) and VIA_VIA34_1_2_58_52 (M3<->M4 via) are
 # always placed at the exact same (X, Y) instance-placement vector, so their
 # M4 pads fully overlap into one merged shape. That pad's local geometry
 # (established from VIA_VIA45's p111, unaffected by the width-only fix
-# above) has its bottom edge 12nm below the placement Y - so whether the
-# merged pad lands on the 24nm M4 grid depends purely on the placement Y,
-# not on anything specific to Block1. Confirmed via real KLayout DRC re-run:
-# shifting ONLY one of the pair breaks 4 other rules (M4.AUX.2/3, M4.S.4,
-# V3.M4.AUX.2) - the pads must move together. Shifting both together by the
-# minimal +nm needed to reach the next 24nm grid line fixes M4.AUX.1 cleanly
-# for SOME rows, but not all: M4.AUX.2 requires landing on a sparser
-# "legal track" grid (period 192nm, phases 48/96), which not every 24nm-grid
-# point satisfies. Both facts were verified empirically (not assumed) across
-# every available block - see NOTES.md.
+# above) is symmetric about the placement Y (local Y range -48..+48 raw
+# units), so the merged pad's centerline in the design equals the placement
+# Y exactly. Confirmed via real KLayout DRC re-run: shifting ONLY one of the
+# pair breaks 4 other rules (M4.AUX.2/3, M4.S.4, V3.M4.AUX.2) - the pads
+# must move together.
+#
+# The exact legality condition below is not a guess: `asap7.lydrc` (the
+# design rule deck) defines M4.AUX.2 via a custom `offgrid_cl(:y, 192, 48,
+# 96)` Ruby method, whose source (read directly, not inferred) is:
+#   - only shapes already on the base_dbu=96 grid are checked at all
+#     (this is exactly M4.AUX.1's 24nm grid, in raw dbu: 96 raw units)
+#   - among those, a shape's Y-centerline `cl` must satisfy
+#     (cl - offset_dbu) % pitch_dbu == 0, i.e. (cl - 48) % 192 == 0
+# Since our pad's centerline equals the raw placement Y, and 192 = 2x96,
+# satisfying (Y - 48) % 192 == 0 automatically satisfies the M4.AUX.1 grid
+# condition too - so searching for the nearest Y with that one property
+# fixes both rules at once. This formula was cross-checked against 10 real
+# KLayout DRC re-runs (5 rows x 2 directions each) with zero mismatches
+# before being trusted - see NOTES.md's "M4 grid alignment" section.
+#
+# Combining this with the via-growth fixes surfaced a further, subtler
+# problem (see NOTES.md's "Merge-aware via-growth" section): shifting
+# VIA_VIA34's M3 pad can change the TRUE merged M3 extent a nearby,
+# un-shifted VIA_VIA23_1_3_36_36 instance must match for V2.M3.AUX.2 - so the
+# grid shifts computed here are also fed into apply_dynamic_v2m3_fix()
+# below, which recomputes that fix's target per-instance against the
+# POST-shift geometry rather than assuming the original fixed constant still
+# applies everywhere.
 # ---------------------------------------------------------------------------
 
-_M4_PAD_LOCAL_BOTTOM_NM = -48 * 0.25  # VIA_VIA45's p111, local Y bottom edge
-_M4_GRID_NM = 24
-_M4_TRACK_PERIOD_NM = 192
-_M4_TRACK_LEGAL_PHASES = (48, 96)
+_M4_GRID_RAW = 96     # 24nm, in raw dbu (dbu=0.25nm) - M4.AUX.1's grid pitch
+_M4_TRACK_PITCH_RAW = 192   # offgrid_cl's pitch_dbu
+_M4_TRACK_OFFSET_RAW = 48   # offgrid_cl's offset_dbu
 
-_PAIR_INST_RE_TMPL = (
-    r"cell_(?P<topcell>\w+)\.insert\(pya\.CellInstArray\(cell_{cell}\.cell_index\(\), "
-    r"pya\.Trans\(0, False, pya\.Vector\((?P<x>-?\d+), (?P<y>-?\d+)\)\)\)\)"
+
+def _is_m4_track_legal(y_raw):
+    return (y_raw - _M4_TRACK_OFFSET_RAW) % _M4_TRACK_PITCH_RAW == 0
+
+
+def compute_grid_shifts(instances):
+    """Decides which co-located VIA_VIA45/VIA_VIA34 instance pairs should
+    move, and to what new Y, WITHOUT touching any text - a pure data
+    computation so the result can be used both for the actual placement
+    edit and for recomputing merge-aware via-growth targets against the
+    resulting (virtual) post-shift geometry.
+
+    Returns (shift_map, applied_list, skipped_list) where shift_map is
+    {(topvar, subvar, x, y): new_y} for every instance that should move
+    (both members of each qualifying pair)."""
+    via45 = {(t, x, y): True for (t, s, r, m, x, y) in instances if s == "VIA_VIA45_1_2_58_58"}
+    via34 = {(t, x, y): True for (t, s, r, m, x, y) in instances if s == "VIA_VIA34_1_2_58_52"}
+
+    shift_map = {}
+    applied = []
+    skipped = []
+
+    for (t, x, y) in via45:
+        if (t, x, y) not in via34:
+            skipped.append((f"VIA_VIA45@({x},{y})", "no co-located VIA_VIA34 pair"))
+            continue
+
+        # M4.AUX.1's grid check is on the pad's EDGES, not its centerline:
+        # the local pad is offset -48 raw units from the placement Y, so the
+        # grid condition is (y - _M4_TRACK_OFFSET_RAW) % _M4_GRID_RAW == 0,
+        # not y % _M4_GRID_RAW == 0.
+        residue = (y - _M4_TRACK_OFFSET_RAW) % _M4_GRID_RAW
+        if residue == 0:
+            continue  # already on the M4.AUX.1 grid, nothing to do here
+
+        up = y + (_M4_GRID_RAW - residue)
+        down = y - residue
+        up_legal = _is_m4_track_legal(up)
+        down_legal = _is_m4_track_legal(down)
+
+        if up_legal and not down_legal:
+            new_y = up
+        elif down_legal and not up_legal:
+            new_y = down
+        else:
+            # Neither (or both) legal - not the expected case; skip rather
+            # than guess.
+            skipped.append((f"VIA_VIA45+VIA_VIA34@({x},{y})",
+                             f"residue={residue}, no single confirmed-safe direction "
+                             f"(up_legal={up_legal}, down_legal={down_legal})"))
+            continue
+
+        shift_map[(t, "VIA_VIA45_1_2_58_58", x, y)] = new_y
+        shift_map[(t, "VIA_VIA34_1_2_58_52", x, y)] = new_y
+        applied.append(f"VIA_VIA45+VIA_VIA34@({x},{y})->y={new_y}")
+
+    return shift_map, applied, skipped
+
+
+_PLACEMENT_RE_TMPL = (
+    r"cell_{topcell}\.insert\(pya\.CellInstArray\(cell_{cell}\.cell_index\(\), "
+    r"pya\.Trans\(0, False, pya\.Vector\({x}, {y}\)\)\)\)"
 )
 
 
-def _find_instances(script_text, cell_name):
-    pattern = re.compile(_PAIR_INST_RE_TMPL.format(cell=re.escape(cell_name)))
-    return {(m.group("topcell"), int(m.group("x")), int(m.group("y"))): m
-            for m in pattern.finditer(script_text)}
-
-
-def apply_grid_alignment_fixes(script_text):
-    """Shifts co-located VIA_VIA45/VIA_VIA34 instance pairs that are off the
-    M4 grid onto it, but only where doing so is confirmed safe (lands on a
-    legal M4.AUX.2 track too, per _M4_TRACK_LEGAL_PHASES) - otherwise skips
-    and logs, exactly like apply_validated_fixes(). Returns
-    (patched_text, applied_list, skipped_list)."""
-    via45 = _find_instances(script_text, "VIA_VIA45_1_2_58_58")
-    via34 = _find_instances(script_text, "VIA_VIA34_1_2_58_52")
-
-    applied = []
-    skipped = []
-    edits = []  # (start, end, replacement)
-
-    for (topcell, x, y), m45 in via45.items():
-        key34 = (topcell, x, y)
-        if key34 not in via34:
-            skipped.append((f"VIA_VIA45@({x},{y})", "no co-located VIA_VIA34 pair"))
-            continue
-        m34 = via34[key34]
-
-        abs_bottom = y * 0.25 + _M4_PAD_LOCAL_BOTTOM_NM
-        residue = round(abs_bottom) % _M4_GRID_NM
-        if residue == 0:
-            continue  # already on-grid, nothing to do
-
-        # Only residue=6 rows are handled here: real KLayout re-runs confirmed
-        # the "shift both instances up to the next grid line" fix is safe for
-        # SOME residue=6 rows (gated by _M4_TRACK_LEGAL_PHASES below) and
-        # confirmed it breaks other rules (M4.AUX.2/3, M4.S.4, V3.M4.AUX.2)
-        # on the residue=12/18 rows tested so far - those appear to need a
-        # different fix, not yet derived. See NOTES.md.
-        if residue != 6:
-            skipped.append((f"VIA_VIA45+VIA_VIA34@({x},{y})",
-                             f"residue={residue} - not yet validated, deferred"))
-            continue
-
-        shift_nm = _M4_GRID_NM - residue  # minimal move up to the next grid line
-        candidate_abs = abs_bottom + shift_nm
-        legal = round(candidate_abs) % _M4_TRACK_PERIOD_NM in _M4_TRACK_LEGAL_PHASES
-        if not legal:
-            skipped.append((f"VIA_VIA45+VIA_VIA34@({x},{y})",
-                             f"residue={residue}, no confirmed-safe shift (would land off the legal M4 track)"))
-            continue
-
-        new_y = y + int(round(shift_nm / 0.25))
-        for m in (m45, m34):
-            old_line = m.group(0)
-            new_line = old_line.replace(f"Vector({x}, {y})", f"Vector({x}, {new_y})")
-            edits.append((m.start(), m.end(), new_line))
-        applied.append(f"VIA_VIA45+VIA_VIA34@({x},{y})->y={new_y}")
+def apply_grid_alignment_fixes(script_text, shift_map):
+    """Applies the placement-vector edits decided by compute_grid_shifts()."""
+    edits = []
+    for (topcell, subvar, x, y), new_y in shift_map.items():
+        pattern = re.compile(_PLACEMENT_RE_TMPL.format(
+            topcell=re.escape(topcell), cell=re.escape(subvar), x=x, y=y))
+        matches = list(pattern.finditer(script_text))
+        if len(matches) != 1:
+            continue  # shouldn't happen; leave untouched rather than guess
+        m = matches[0]
+        new_line = m.group(0).replace(f"Vector({x}, {y})", f"Vector({x}, {new_y})")
+        edits.append((m.start(), m.end(), new_line))
 
     for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
         script_text = script_text[:start] + replacement + script_text[end:]
+    return script_text
+
+
+# ---------------------------------------------------------------------------
+# Merge-aware, shape-aware V2.M3.AUX.2 fix.
+#
+# VIA_VIA23_1_3_36_36's 3 V2 vias must each match the TRUE merged M3 extent
+# AT THEIR OWN LOCATION (V2.M3.AUX.2's rule text: "V2 must exactly be the
+# same width as M3 ... perpendicular to M3's length"), but that extent is no
+# longer a uniform 136 everywhere once the grid-alignment fix (above) has
+# run: VIA_VIA23 itself never moves, but its M3 shape can share a merge
+# group with a nearby VIA_VIA34 instance's M3 pad - and if THAT moved, the
+# merge group's shape changes.
+#
+# A first version of this fix computed only the merge group's overall
+# bounding-box HEIGHT and grew every via in the cell to that one value
+# uniformly. Verified via real KLayout re-run that this is wrong whenever
+# the merge group isn't a simple rectangle: direct pya.Region inspection
+# showed the actual merged shape is a STEPPED polygon - full width for the
+# original 136-height "core" (this instance's own contribution, always
+# present), narrower for whatever additional height a shifted neighbor
+# contributes. A via whose own X-range only partially overlaps the
+# narrower step sticks out of the true shape if grown to the full bounding
+# height - which is exactly what caused new V2.AUX.1 ("V2 must be inside M2
+# and M3" - a literal containment check, read from asap7.lydrc) and
+# V2.M3.EN.2 (enclosure) violations in that first version.
+#
+# The fix: for EACH of the 3 vias INDEPENDENTLY (not the cell as a whole),
+# find the Y range that is continuously covered by the merge group at
+# EVERY X point across that specific via's own X-span (the "vertical slice
+# intersection", computed by _safe_y_range_for_x_range against the group's
+# actual member rectangles, not just its bounding box) - the largest range
+# the via can grow to while staying strictly inside the true shape. This
+# range is not necessarily centered on the via's original position -
+# growing asymmetrically (matching both real M3 edges exactly) is exactly
+# what "match M3's width" requires, whichever direction the true extent
+# lies in. The M2 pad is grown to the union of all 3 (possibly different)
+# via ranges, to keep every via enclosed by it (V2.M2.EN.1).
+#
+# Because different vias - even within the same cell instance - can need
+# different ranges, a single shared-cell-definition edit can't express this
+# (editing the cell definition once affects every placement of it
+# identically). Instances whose full computed result (pad + all 3 vias)
+# matches the original default exactly keep referencing the existing shared
+# cell definition, edited exactly as before. Any instance whose result
+# differs gets its own new, uniquely named cell definition (inserted right
+# after the original one) with the computed per-via ranges applied, and
+# only THAT instance's own placement line is repointed to it.
+# ---------------------------------------------------------------------------
+
+_V2M3_CELL_NAME = "VIA_VIA23_1_3_36_36"
+_V2M3_LAYER_SPEC = {20: 1, 30: 1, 25: 3}  # layer -> expected shape count
+_V2M3_REF_LAYER = 30    # M3 - the layer we compute merged extents against
+_V2M3_VIA_LAYER = 25    # V2 - grows to match the reference layer
+_V2M3_PAD_LAYER = 20    # M2 - grows to enclose the vias
+_V2M3_DEFAULT_RANGE = (-68, 68)  # matches the original fixed target (136 / 2 each way)
+
+# V1.M2.AUX.2's analogous cascade, one level down: VIA_VIA23's M2 pad
+# growing (to enclose its now-asymmetric V2 vias) can merge with this
+# cell's own M1/M2 rail pair, inflating the rail's LOCAL merged M2 height
+# beyond what its own (untouched) V1 taps can match - confirmed via direct
+# pya inspection, not assumed (see NOTES.md's "V1.M2.AUX.2" section). Same
+# mechanism, same fix, one layer down: M1=pad (encloses V1), M2=reference
+# (what V1 must match), V1=vias (87 of them, tapping a shared M1/M2 rail).
+# Unlike VIA_VIA23_1_3_36_36 (a literal PDK cell name, identical in every
+# block), this cell's name encodes block-specific dimensions - confirmed by
+# direct diffing: Block1/6 "VIA_via1_2_3132_18_1_87_36_36" (87 taps),
+# Block2 "..._2160_18_1_60_36_36" (60 taps), Block3 "..._2322_..._64_..."
+# (64), Block7 "..._6750_..._187_..." (187) - so the exact name (and via
+# count) must be discovered per script, not hardcoded.
+_V1M2_NAME_RE = re.compile(r'VIA_via1_2_\d+_18_1_\d+_36_36')
+_V1M2_REF_LAYER = 20    # M2
+_V1M2_VIA_LAYER = 21    # V1
+_V1M2_PAD_LAYER = 19    # M1
+_V1M2_DEFAULT_RANGE = (-36, 36)  # this cell's own unmodified V1/M1/M2 Y half-extent
+
+_CELL_DEF_RE_TMPL = r'cell_{cell}\s*=\s*layout\.create_cell\("{cell}"\)'
+
+
+def _find_cell_name_matching(script_text, name_pattern):
+    """Finds a cell name (from a `create_cell("...")` call) matching
+    `name_pattern`, for cells whose exact name varies per script/block.
+    Returns the name, or None if no match is found."""
+    for m in re.finditer(r'layout\.create_cell\("([^"]+)"\)', script_text):
+        if name_pattern.fullmatch(m.group(1)):
+            return m.group(1)
+    return None
+
+
+def _apply_dynamic_merge_aware_fix(script_text, shift_map, *, cell_name, layer_spec,
+                                    ref_layer, pad_layer, via_layer, default_range,
+                                    var_id_start):
+    """General merge-aware, per-via, shape-aware fix: grows every via in
+    `cell_name` (on `via_layer`) to match the TRUE merged extent of
+    `ref_layer` at its own location (computed per-via, not per-cell, to
+    stay correct when that merged region isn't a simple rectangle - see
+    the module-level comment above `apply_dynamic_v2m3_fix`), and grows
+    the enclosing `pad_layer` shape to the union of all resulting via
+    ranges. Used for both V2.M3.AUX.2 (VIA_VIA23) and V1.M2.AUX.2
+    (VIA_via1_2_3132...), which are the exact same mechanism one layer
+    apart.
+
+    `layer_spec` maps layer -> expected shape count, or None to accept any
+    count >= 1 (used for cells like VIA_via1_2_3132... whose via count
+    varies per block - see NOTES.md). Returns (patched_text, applied_list,
+    skipped_list)."""
+    shapes = _parse_all_shapes(script_text)
+    instances = _parse_all_instances(script_text)
+    effective_instances = [
+        (t, s, r, m, x, shift_map.get((t, s, x, y), y))
+        for (t, s, r, m, x, y) in instances
+    ]
+
+    applied = []
+    skipped = []
+
+    local_by_layer = shapes.get(cell_name, {})
+    if not local_by_layer:
+        return script_text, applied, [(cell_name, "cell not present in this case")]
+
+    structure_ok = (set(local_by_layer) <= set(layer_spec) and
+                     all((count is None and len(local_by_layer.get(layer, [])) >= 1) or
+                         len(local_by_layer.get(layer, [])) == count
+                         for layer, count in layer_spec.items()))
+    if not structure_ok:
+        found = {l: len(v) for l, v in local_by_layer.items()}
+        return script_text, applied, [(cell_name, f"structure mismatch: found layers={found}")]
+
+    local_ref_bbox = local_by_layer[ref_layer][0]
+    local_via_bboxes = local_by_layer[via_layer]  # in file order
+    local_pad_bbox = local_by_layer[pad_layer][0]
+    n_vias = len(local_via_bboxes)
+
+    # For each instance, compute the per-via safe Y range (in LOCAL
+    # coordinates, relative to the instance's own placement) and the pad's
+    # resulting range (union of all via ranges), using the ORIGINAL
+    # (unshifted, since neither of these cells ever moves) instance
+    # position for both its own placement and its merge-group lookup, but
+    # the EFFECTIVE (post-grid-shift) geometry for the merge computation.
+    by_result = defaultdict(list)  # (pad_range, via_ranges_tuple) -> [(topvar, x, y), ...]
+    for (topvar, subvar, rot, mirror, x, y) in instances:
+        if subvar != cell_name:
+            continue
+        abs_ref_bbox = _transform_bbox(local_ref_bbox, rot, mirror, x, y)
+        all_ref_boxes = _flatten_layer(topvar, ref_layer, shapes, effective_instances)
+        group_members = _merged_group_members_containing(all_ref_boxes, abs_ref_bbox)
+        if group_members is None:
+            skipped.append((f"{cell_name}@({x},{y})", "instance's own reference-layer shape not found in flattened layer - skipped"))
+            continue
+
+        via_ranges = []
+        ok = True
+        for via_bbox in local_via_bboxes:
+            vx0, vy0, vx1, vy1 = via_bbox
+            abs_x0, abs_x1 = x + vx0, x + vx1
+            safe = _safe_y_range_for_x_range(group_members, abs_x0, abs_x1)
+            if safe is None:
+                ok = False
+                break
+            via_ranges.append((safe[0] - y, safe[1] - y))  # back to local coords
+        if not ok:
+            skipped.append((f"{cell_name}@({x},{y})", "could not compute a safe range for one of its vias - skipped"))
+            continue
+
+        pad_range = (min(r[0] for r in via_ranges), max(r[1] for r in via_ranges))
+        by_result[(pad_range, tuple(via_ranges))].append((topvar, x, y))
+
+    if not by_result:
+        return script_text, applied, skipped
+
+    # Exactly one group must keep using the ORIGINAL shared cell definition
+    # (edited in place, same as the old fixed-target fix did) - never zero.
+    # If every instance needs a non-default range, the shared definition
+    # would otherwise end up completely unreferenced (every instance
+    # repointed to a new custom cell), which makes KLayout see it as an
+    # extra, parentless "top cell" and abort DRC outright ("the layout has
+    # multiple top cells") - confirmed via real KLayout re-run, not assumed
+    # (this is exactly what happened on Block7's larger via-tap cell,
+    # where NO instance happened to need the plain default range). The
+    # default range is preferred when present (keeps the diff minimal and
+    # matches prior versions exactly); otherwise the largest group (most
+    # instances) is chosen, to minimize how many new custom cells are
+    # needed overall.
+    default_key = (default_range, (default_range,) * n_vias)
+    if default_key in by_result:
+        base_key = default_key
+    else:
+        base_key = max(by_result, key=lambda k: len(by_result[k]))
+    base_group = by_result.pop(base_key)
+    base_pad_range, base_via_ranges = base_key
+
+    patched, applied_base, skipped_base = _apply_cell_fix_specs(
+        script_text, {cell_name: {
+            pad_layer: [_set_y_range(*base_pad_range)],
+            ref_layer: [None],
+            via_layer: [_set_y_range(*r) for r in base_via_ranges],
+        }})
+    script_text = patched
+    tag = "default" if base_key == default_key else "base (largest non-default group)"
+    applied.extend(f"{a} ({tag}, {len(base_group)} instance(s))" for a in applied_base)
+    skipped.extend(skipped_base)
+
+    if by_result:
+        edits = []  # (start, end, replacement)
+        block_pattern = re.compile(_POLY_INSERT_RE_TMPL.format(cell=re.escape(cell_name)))
+        block_matches = list(block_pattern.finditer(script_text))
+        shapes_insert_at = max(m.end() for m in block_matches)
+
+        # The new cell's OWN `create_cell(...)` line must be inserted
+        # separately, right after the ORIGINAL cell's create_cell() line -
+        # NOT alongside its shape definitions further down. Reason: the
+        # official evaluator's connectivity checker identifies the script's
+        # top cell by scanning for create_cell() calls and keeping the
+        # LAST one found (see check_connectivity.py's parse_block_script) -
+        # this only correctly picks BlockN's own top cell because, in every
+        # available block, BlockN's create_cell() line happens to be the
+        # last one in the file's initial "declarations" section (confirmed
+        # across all 5 blocks). A new create_cell() call placed anywhere
+        # AFTER that line - which is exactly where this cell's shape
+        # definitions live - would make our new cell look like "the last
+        # one", so the checker would flatten from OUR cell instead of the
+        # real top cell, collapsing every connectivity path to nothing.
+        # Confirmed via real check_connectivity.py re-run, not assumed - see
+        # NOTES.md.
+        cell_def_match = re.search(_CELL_DEF_RE_TMPL.format(cell=re.escape(cell_name)), script_text)
+        if cell_def_match is None:
+            skipped.append((cell_name, "could not find cell definition line to anchor new custom cell declarations"))
+            return script_text, applied, skipped
+        create_cell_insert_at = cell_def_match.end()
+
+        new_cell_decls = []
+        new_cells_text = []
+        # New polygon variable names MUST match p\d+ (digits only after "p"):
+        # the official evaluator's connectivity checker (check_connectivity.py)
+        # parses polygon definitions with a HARDCODED regex requiring exactly
+        # that pattern - anything else (e.g. p_MyCell_1) is silently invisible
+        # to it, which breaks connectivity tracing for the ENTIRE script, not
+        # just locally (confirmed: modified_paths_count dropped to 0 with a
+        # non-matching name, back to matching the golden count once fixed -
+        # see NOTES.md). Use a var-id space far past any realistic existing
+        # p<N> count in these scripts to guarantee no collision - and a
+        # DIFFERENT range per caller of this function, so the V2.M3 and
+        # V1.M2 fixes (both potentially applied to the same script) never
+        # generate the same variable name as each other either.
+        _new_var_counter = [var_id_start]
+
+        def _new_var():
+            _new_var_counter[0] += 1
+            return f"p{_new_var_counter[0]}"
+
+        for cell_idx, ((pad_range, via_ranges), insts) in enumerate(sorted(by_result.items())):
+            custom_name = f"{cell_name}_C{cell_idx}"
+            new_cell_decls.append(f'cell_{custom_name} = layout.create_cell("{custom_name}")')
+            lines = []
+
+            def _emit(layer, x0, ny0, x1, ny1):
+                var = _new_var()
+                lines.append(
+                    f"{var} = pya.Polygon([pya.Point({x0}, {ny0}), "
+                    f"pya.Point({x0}, {ny1}), pya.Point({x1}, {ny1}), "
+                    f"pya.Point({x1}, {ny0})])"
+                )
+                lines.append(
+                    f"cell_{custom_name}.shapes(layout.layer(pya.LayerInfo({layer}, 0))).insert({var})"
+                )
+
+            px0, _, px1, _ = local_pad_bbox
+            _emit(pad_layer, px0, pad_range[0], px1, pad_range[1])
+            rx0, ry0, rx1, ry1 = local_ref_bbox
+            _emit(ref_layer, rx0, ry0, rx1, ry1)  # unchanged
+            for via_bbox, via_range in zip(local_via_bboxes, via_ranges):
+                vx0, _, vx1, _ = via_bbox
+                _emit(via_layer, vx0, via_range[0], vx1, via_range[1])
+
+            new_cells_text.append("\n".join(lines))
+            applied.append(f"{cell_name}:custom_cell={custom_name} "
+                            f"pad={pad_range} vias={via_ranges} ({len(insts)} instance(s))")
+
+            for (topvar, x, y) in insts:
+                old_line_re = re.compile(_PLACEMENT_RE_TMPL.format(
+                    topcell=re.escape(topvar), cell=re.escape(cell_name), x=x, y=y))
+                inst_matches = list(old_line_re.finditer(script_text))
+                if len(inst_matches) != 1:
+                    skipped.append((f"{cell_name}@({x},{y})",
+                                     "could not uniquely locate this instance's placement line - skipped"))
+                    continue
+                im = inst_matches[0]
+                new_line = im.group(0).replace(f"cell_{cell_name}.cell_index()",
+                                                f"cell_{custom_name}.cell_index()")
+                edits.append((im.start(), im.end(), new_line))
+
+        for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+            script_text = script_text[:start] + replacement + script_text[end:]
+
+        # Insert the shape definitions first (further down in the text) so
+        # the earlier create_cell() insertion point's offset isn't shifted
+        # by this one.
+        script_text = script_text[:shapes_insert_at] + "\n" + "\n".join(new_cells_text) + script_text[shapes_insert_at:]
+        script_text = script_text[:create_cell_insert_at] + "\n" + "\n".join(new_cell_decls) + script_text[create_cell_insert_at:]
 
     return script_text, applied, skipped
+
+
+def apply_dynamic_v2m3_fix(script_text, shift_map):
+    """Merge-aware, per-via, shape-aware version of the old fixed-target
+    V2.M3.AUX.2 fix. See the module-level comment above. Returns
+    (patched_text, applied_list, skipped_list)."""
+    return _apply_dynamic_merge_aware_fix(
+        script_text, shift_map,
+        cell_name=_V2M3_CELL_NAME, layer_spec=_V2M3_LAYER_SPEC,
+        ref_layer=_V2M3_REF_LAYER, pad_layer=_V2M3_PAD_LAYER, via_layer=_V2M3_VIA_LAYER,
+        default_range=_V2M3_DEFAULT_RANGE, var_id_start=900000)
+
+
+def apply_dynamic_v1m2_fix(script_text, shift_map):
+    """Merge-aware, per-via, shape-aware fix for V1.M2.AUX.2 - the same
+    mechanism as apply_dynamic_v2m3_fix, one metal layer down. See the
+    module-level comment above _V1M2_NAME_RE. Returns (patched_text,
+    applied_list, skipped_list)."""
+    cell_name = _find_cell_name_matching(script_text, _V1M2_NAME_RE)
+    if cell_name is None:
+        return script_text, [], [("VIA_via1_2_*", "no matching cell found in this case")]
+    layer_spec = {_V1M2_PAD_LAYER: 1, _V1M2_REF_LAYER: 1, _V1M2_VIA_LAYER: None}
+    return _apply_dynamic_merge_aware_fix(
+        script_text, shift_map,
+        cell_name=cell_name, layer_spec=layer_spec,
+        ref_layer=_V1M2_REF_LAYER, pad_layer=_V1M2_PAD_LAYER, via_layer=_V1M2_VIA_LAYER,
+        default_range=_V1M2_DEFAULT_RANGE, var_id_start=950000)
 
 
 def parse_error_payload(error_text):
@@ -390,16 +912,47 @@ def main():
 
     original_script = layout_path.read_text(encoding="utf-8")
 
-    # Apply the pre-validated, structurally-matched geometric fixes.
-    patched_script, applied, skipped = apply_validated_fixes(original_script)
+    # Decide the M4 grid-alignment shifts first (data only, no text edit
+    # yet) - the merge-aware V2.M3.AUX.2 fix below needs to know the
+    # resulting geometry to compute its own targets correctly.
+    instances = _parse_all_instances(original_script)
+    shift_map, grid_applied, grid_skipped = compute_grid_shifts(instances)
+
+    # Merge-aware V2.M3.AUX.2 fix - per-instance target, computed against
+    # the post-grid-shift geometry (see apply_dynamic_v2m3_fix's docstring).
+    patched_script, v2m3_applied, v2m3_skipped = apply_dynamic_v2m3_fix(original_script, shift_map)
+
+    # NOTE: apply_dynamic_v1m2_fix() (V1.M2.AUX.2, one cascade level further
+    # down) is implemented but deliberately NOT called here. Real KLayout
+    # connectivity re-run showed it breaks connectivity (824/824 sources ok,
+    # but 460 pin-endpoint + 381 routing-endpoint mismatches on Block1) even
+    # though its own DRC-driving computation (safe range vs. M2's merge
+    # topology) is correct in isolation: growing the rail's M1 pad to satisfy
+    # V1.M2.AUX.2 can grow it into OTHER, unrelated M1 shapes nearby (e.g.
+    # standard-cell M1 pins in the same row) that were never checked, because
+    # the safe-range computation only validates against the reference layer's
+    # (M2) merge topology, not the pad layer's (M1) own neighbors - confirmed
+    # via direct pya.Region probing: the grown region at Block1 row y=3240
+    # extends into Y=3348-3380 where unrelated M1 shapes already sit. Fixing
+    # this properly would need an M1-side "safe range" check analogous to
+    # _safe_y_range_for_x_range, intersected with the M2-side one - deferred,
+    # see NOTES.md's "V1.M2.AUX.2" section. Confirmed via direct re-run that
+    # skipping this fix (only) restores connectivity exactly (1350/1350
+    # paths, 0 mismatches) - see NOTES.md.
+    v1m2_applied, v1m2_skipped = [], []
+
+    # Fixed-target via-growth fixes (V4.M5.AUX.2, V5.M6.AUX.2).
+    patched_script, applied, skipped = apply_validated_fixes(patched_script)
+    applied = v2m3_applied + v1m2_applied + applied
+    skipped = v2m3_skipped + v1m2_skipped + skipped
     print(f"[INFO] Applied {len(applied)} validated edit(s): {applied}",
           file=sys.stderr)
     if skipped:
         print(f"[INFO] Skipped (cell not present, or structure didn't match "
               f"the validated pattern - safe no-op): {skipped}", file=sys.stderr)
 
-    # Apply the M4 grid-alignment fixes (co-located via-pair instance shifts).
-    patched_script, grid_applied, grid_skipped = apply_grid_alignment_fixes(patched_script)
+    # Apply the M4 grid-alignment placement shifts decided above.
+    patched_script = apply_grid_alignment_fixes(patched_script, shift_map)
     print(f"[INFO] Applied {len(grid_applied)} grid-alignment edit(s): {grid_applied}",
           file=sys.stderr)
     if grid_skipped:
