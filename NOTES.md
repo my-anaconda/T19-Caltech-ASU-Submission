@@ -1779,4 +1779,63 @@ class that made the M6.AUX.1 near-miss and the original whole-pad-growth
 V1.M2.AUX.2 attempt unsafe, and would need their own dedicated
 merge-awareness investigation before being safe to touch.
 
+### Why `row_wide` isn't the same fix with extra steps (real DRC re-run, deferred)
+
+Picked back up per instruction to also attempt the `row_wide` bucket. First
+found *why* these are "row-wide" at all: direct inspection of one instance
+(Block1's marker 4, `via1_2_3132_18_1_87_36_36_C6`) shows the owning cell has
+**87** V1 vias and only 2 M1 shapes total - `apply_dynamic_v1m2_fix`'s own
+per-instance grouping bundles every via across an entire standard-cell row
+that happens to need the same computed range into ONE custom cell, and
+`_patches_for`'s adjacent-cluster merge (see its module comment above) then
+cascades: once two neighboring vias both need growth, their patches merge;
+if enough vias along the row need growth, the merge chain covers nearly the
+whole row (12456-26856 raw units observed, block-dependent). So `row_wide`
+isn't "the same small dedicated patch, just wider" - it's the visible symptom
+of an entire row's worth of vias already needing growth, patched together by
+the existing fix's own (correct) merge-safety logic.
+
+**Hypothesis tested**: rather than growing the already-huge merged patch
+(touching its whole width), add a brand-new, separate, narrow M1 patch at
+just the target via's own local X window (mirroring the small_local fix's
+own patch shape) at the grown Y-range, leaving the existing giant patch
+untouched. Real DRC re-run, all 7 distinct `(gap_top, gap_bot)` patterns
+found across the entire 284-case population (confirmed only 7 distinct pairs
+exist, so this covers the whole bucket), tested against both Block1 (least
+dense) and Block7 (most dense, 161 of the 284 cases):
+
+| Pattern (Block1) | Result | Pattern (Block7) | Result |
+|---|---|---|---|
+| (104,32) | 141->144 (+3): `V0.M1.AUX.3`, `M1.S.2`, `M1.S.5` | (104,32) | 474->547 (**+73**): cascades into 18 `M1.S.2`, 15 `V0.M1.AUX.3`, 10 `V1.AUX.1`, more |
+| (32,80) | 141->143 (+2) | (32,80) | 474->557 (**+83**, `V1.M2.AUX.2` itself got *worse*, +10) |
+| (56,32) | 141->151 (+10) | (56,32) | 474->541 (**+67**) |
+| (32,32) | 141->144 (+3) | (32,32) | 474->480 (+6) |
+| (32,56) | 141->144 (+3) | (32,56) | 474->477 (+3) |
+| (80,32) | 141->146 (+5) | (80,32) | 474->477 (+3) |
+| (32,104) | 141->151 (+10) | (32,104) | 474->539 (**+65**) |
+
+**Every single one is a real regression, and the damage scales sharply with
+block density/size** - Block1 (fewest row_wide instances) takes a small hit
+per case; Block7 (most instances, most crowded rows) takes a severe one,
+occasionally making the very rule being targeted worse overall. The
+recurring collateral (`V0.M1.AUX.3` - a V0 contact flush against the
+default M1 edge, the same mechanism `_v0_safe_range_for_via` already guards
+against in the small_local fix; real `M1.S.2`/`M1.S.5`/`M1.S.6` spacing
+hits; and on the worst cases, new `V1.AUX.1`/`V1.M2.EN.2`/`V1.S.2`
+violations on *other*, previously-fine vias nearby) confirms these rows are
+genuinely densely packed - that's *why* so many vias needed growth in the
+first place, cascading `_patches_for`'s merge into one giant patch. This is
+not the same shape as the small_local win: there, growing a via's own small,
+otherwise-empty local patch was usually free; here, the local area is
+already saturated with real neighbors on every side.
+
+**Left deferred, not attempted further** - same discipline as M6.AUX.1
+above: a real, cross-block-verified negative result, not a guess. A future
+attempt would need the small_local fix's full 3-way safety computation (M2
+merge topology, foreign M1 spacing, V0 flush alignment) extended to reason
+about an entire merged row's vias *jointly* rather than one at a time (since
+growing any one via in a saturated row changes what's safe for its
+neighbors) - a substantially bigger undertaking than the per-instance
+approach that worked for `small_local`.
+
 
