@@ -72,6 +72,25 @@ deliberately left untouched (their limiting edge belongs to `VIA_VIA34`/
 blast-radius class that made blind `VIA_VIA12` edits catastrophic elsewhere
 in this file).
 
+Back to fully deterministic: `M5.AUX.1` (M5 vertical edges must land on a
+24nm grid, the same rule family as `M4.AUX.1`) is fixed by growing a
+violating rail's edge OUTWARD to the nearest grid line - safe by
+construction because it only ever grows (never shrinks past what it
+already encloses), gated by a static "stub check" (does any other shape
+on the same layer extend past the rail's own range at the edge being
+moved?) built on the same nested-instance flattening machinery the
+`V1.M2.AUX.2`/`V2.M3.AUX.2` fixes already use. No model call - the stub
+check already IS the safety verification, there's no ambiguous choice to
+make. This one had a real, cross-block-caught near-miss of its own: an
+early version also touched `M6.AUX.1` (the same mechanism, one layer up),
+which looked harmless on Block1 (a 1-for-1 trade against a new
+`V5.M6.AUX.2` instance) but turned out to be a net +12 regression on
+Block7 once actually verified against every block - removed before it
+ever reached a commit. See NOTES.md's `M5.AUX.1` section for the full
+derivation, including the "topmost group" heuristic that looked right on
+Block1 alone and was falsified by Block2/Block5, and why `M6.AUX.1` stays
+deferred rather than shipped on an unverified assumption.
+
 Verified end-to-end through this exact `agent.py`'s actual CLI entrypoint,
 real KLayout 0.30.1, real evaluator, against every available block, each
 compared to that block's own *true* pristine floor (a live KLayout re-run of
@@ -80,22 +99,22 @@ see NOTES.md for why that assumption is wrong):
 
 | Case | Pristine floor | FVR (`final_violation_rate`) | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.6270** | 0.668 | preserved |
-| Block2 | 1.3235 | **0.5147** | 0.677 | preserved |
-| Block3 | 1.2472 | **0.7191** | 0.573 | preserved |
-| Block4 | 1.2857 | **0.5306** | 0.680 | preserved |
+| Block1 | 1.2910 | **0.6025** | 0.668 | preserved |
+| Block2 | 1.3235 | **0.4706** | 0.677 | preserved |
+| Block3 | 1.2472 | **0.6517** | 0.618 | preserved |
+| Block4 | 1.2857 | **0.4898** | 0.694 | preserved |
 | Block5 | 1.2794 | **0.6471** | 0.588 | preserved |
-| Block6 | 1.2996 | **0.6518** | 0.729 | preserved |
-| Block7 | 1.2510 | **0.6431** | 0.655 | preserved |
+| Block6 | 1.2996 | **0.6154** | 0.745 | preserved |
+| Block7 | 1.2510 | **0.6235** | 0.665 | preserved |
 
 FVR is the benchmark's own primary scoring metric (`final_violation_rate` -
 fresh DRC violation count on the repaired script, divided by the original
 violation count; lower is better, gates on `valid_repair`/
-`connectivity_preserved`). Block1's FVR reflects the hybrid LLM+deterministic
-`M4.S.5` fix below (0.6311 -> 0.6270); every other block is unchanged from
-the purely-deterministic fixes, since their `M4.S.5` candidates (where any
-existed) had no safety-verified top-level edit available and correctly
-degraded to a no-op - see the `M4.S.5` section of NOTES.md.
+`connectivity_preserved`). These reflect both the hybrid LLM+deterministic
+`M4.S.5` fix (Block1 only, its one safety-verified candidate) and the fully
+deterministic `M5.AUX.1` grid-rail fix (every block except Block5, whose
+off-grid rails are all stub-blocked). See NOTES.md's `M4.S.5` and
+`M5.AUX.1` sections for the full derivation of each.
 
 Every case: `valid_repair: true`, `connectivity_preserved: true`, and
 `final_violation_rate` genuinely below that block's own true pristine floor -
@@ -198,14 +217,15 @@ cat factors/t19-final/block/repair/Block1_factors.json
 ```
 
 Expect `valid_repair: true`, `connectivity_preserved: true` for Block1 in
-every case. `final_violation_rate`/`repair_rate` depend on whether the
-`M4.S.5` model call (the one non-deterministic step in this agent, see
-above) succeeds: `0.6270475...`/`0.6680327...` with the model reachable and
-approving the one safe candidate (confirmed via direct local testing,
-KLayout 0.30.1 via WSL, real `gemini-3.5-flash` call through
-`model_endpoint`), or the prior `0.6311475...`/`0.6639344...` if the
-endpoint is unreachable or the model rejects/mis-responds - both are real,
-valid, connectivity-preserved outcomes, never a worse one. The same command
+every case. The deterministic `M5.AUX.1` grid-rail fix always applies
+regardless of model availability; `final_violation_rate`/`repair_rate`
+additionally reflect the one `M4.S.5` model call (the only non-deterministic
+step in this agent) when it succeeds: `0.6024590...`/`0.6680327...` with the
+model reachable and approving the one safe candidate (confirmed via direct
+local testing, KLayout 0.30.1 via WSL, real `gemini-3.5-flash` call through
+`model_endpoint`), or a slightly smaller improvement if the endpoint is
+unreachable or the model rejects/mis-responds - both are real, valid,
+connectivity-preserved outcomes, never a worse one. The same command
 with `--case Block2/Block3/Block4/Block5/Block6/Block7` reproduces the
 corresponding rows in the results table above. See `NOTES.md` for the full
 derivation of these fixes, why the naive floor isn't exactly `1.0`, and what's

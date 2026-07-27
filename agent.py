@@ -545,6 +545,185 @@ def apply_grid_alignment_fixes(script_text, shift_map):
 
 
 # ---------------------------------------------------------------------------
+# M5.AUX.1 grid-alignment fix (M5 rail vertical edges off the 24nm grid).
+# Fully deterministic - unlike M4.S.5 above, there is no ambiguous choice
+# between candidates for a model to make: the safety check below either
+# finds a real, provably-safe edit or it doesn't.
+#
+# M6.AUX.1 (the same kind of rule, one metal layer up) is NOT included here
+# despite sharing the same mechanism and the same stub-check machinery below
+# - see apply_grid_rail_fix()'s docstring for why: it looked net-neutral on
+# Block1 alone but turned out to be a real regression on Block7 once
+# actually cross-block-verified. Deferred, not abandoned.
+#
+# Earlier investigation (see NOTES.md) concluded this rule was intractable
+# because the violating M5 shapes are genuine, block-spanning top-level
+# rails (not small via-cell pads) - moving one seemed to risk the same
+# high-reuse blast radius as VIA_VIA12. Revisited because growing a rail's
+# edge OUTWARD (never shrinking) to the nearest grid line is a much
+# smaller, more local change than "move the rail" - and because this is a
+# single top-level polygon, not a shared library cell, so the only real
+# risk is a different top-level shape (or a via-cell pad) that happens to
+# rely on the rail's EXACT current edge position.
+#
+# That risk turned out to be real and precisely characterizable: a
+# "stub" bug, caught by real KLayout re-run before shipping (see
+# NOTES.md's "Fixes that didn't work" precedent for why this matters) -
+# some via-cell M5 pads (e.g. VIA_VIA45_1_2_58_58) extend slightly BEYOND
+# the rail's own bbox in Y at the exact edge being snapped. Growing only
+# the rail's edge (not the via's own unrelated local pad) leaves that via's
+# unchanged extension as a new, still-off-grid sliver - the fix appears to
+# apply but the target violation count doesn't move, plus new M5.AUX.3/
+# M5.S.4/M5.W.3 violations appear. The fix below detects this via a static
+# "stub check" (does any OTHER shape on this layer, at this rail's own
+# X-range, extend past the rail's Y-range at the edge being moved?) using
+# the same _flatten_layer()/_transform_bbox() nested-instance machinery
+# already validated elsewhere in this file - no live KLayout needed at
+# grading time. A stubbed edge is skipped, not guessed at.
+#
+# Verified end-to-end (real CLI entrypoint, real evaluate_repair.py) across
+# all 7 blocks: every block with a stub-free candidate shows a strict
+# improvement (Block1 153->147, Block2 35->32, Block3 64->58, Block4 78->72,
+# Block6 161->152, Block7 492->477 final_violations - repair_rate improves
+# or holds steady in every case, connectivity_preserved stays true
+# throughout). Block5 correctly produces zero candidates - every one of its
+# off-grid M5 rails is stub-blocked. A small M5.W.3 (width) collateral (1-5
+# instances) appears alongside the fix in every improved block - net
+# positive every time, same "net win, not can never be worse" honesty as
+# the rest of this file's fixes.
+# ---------------------------------------------------------------------------
+
+_M5_GRID_RAW = 96    # 24nm - M5.AUX.1's vertical-edge grid pitch
+_M6_GRID_RAW = 128   # 32nm - M6.AUX.1's horizontal-edge grid pitch
+_MIN_RAIL_LEN_RAW = 5000  # 1.25um - distinguishes a rail from a small via pad
+
+
+def _snap_outward(value, grid, grow_positive):
+    if value % grid == 0:
+        return value
+    return ((value // grid) + 1) * grid if grow_positive else (value // grid) * grid
+
+
+def find_grid_rail_candidates(script_text, top_cell_var, layer_num, grid_raw, axis):
+    """Finds every top-level rail-like rectangle on `layer_num` whose edge
+    along `axis` ("x" for M5's vertical edges, "y" for M6's horizontal
+    edges) is off the given grid, and is safe to snap outward to the
+    nearest grid line - i.e. no other shape on the same layer, within this
+    rail's own span on the OTHER axis, extends past the rail's own range on
+    `axis` (the "stub" check - see module comment above). Returns a list of
+    {var, span, side, old_val, new_val} - fully self-contained, ready to
+    apply without any further judgment call."""
+    shapes = _parse_all_shapes(script_text)
+    instances = _parse_all_instances(script_text)
+    top_level = shapes.get(top_cell_var, {}).get(layer_num, [])
+    all_boxes = _flatten_layer(top_cell_var, layer_num, shapes, instances)
+
+    insert_re = re.compile(
+        rf"^cell_{re.escape(top_cell_var)}\.shapes\(layout\.layer\(pya\.LayerInfo\({layer_num}, 0\)\)\)"
+        rf"\.insert\((p\d+)\)\s*$", re.MULTILINE)
+    poly_def_re = re.compile(r"^(p\d+) = pya\.Polygon\(\[(.*?)\]\)\s*$", re.MULTILINE)
+    poly_info = {}
+    for m in poly_def_re.finditer(script_text):
+        pts = tuple(int(v) for pair in _POINT_RE.findall(m.group(2)) for v in pair)
+        if len(pts) != 8:
+            continue
+        bbox = _poly_bbox(pts)
+        if len(set(pts[0::2])) != 2 or len(set(pts[1::2])) != 2:
+            continue
+        poly_info[m.group(1)] = {"bbox": bbox, "span": (m.start(2), m.end(2))}
+    top_level_vars = {m.group(1) for m in insert_re.finditer(script_text)}
+    var_by_bbox = {info["bbox"]: {"var": v, "span": info["span"]}
+                   for v, info in poly_info.items() if v in top_level_vars}
+
+    candidates = []
+    for bbox in top_level:
+        l, b, r, t = bbox
+        rail_len = (t - b) if axis == "x" else (r - l)
+        if rail_len < _MIN_RAIL_LEN_RAW:
+            continue
+        info = var_by_bbox.get(bbox)
+        if not info:
+            continue
+
+        if axis == "x":
+            edges = [("left", l, False), ("right", r, True)]
+        else:
+            edges = [("bottom", b, False), ("top", t, True)]
+
+        for side, old_val, grow_positive in edges:
+            if old_val % grid_raw == 0:
+                continue
+            new_val = _snap_outward(old_val, grid_raw, grow_positive)
+            stub = False
+            for ob in all_boxes:
+                if ob == bbox:
+                    continue
+                obl, obb, obr, obt = ob
+                if axis == "x":
+                    if obr <= l - 4 or obl >= r + 4:
+                        continue
+                    if obb < b or obt > t:
+                        stub = True
+                        break
+                else:
+                    if obt <= b - 4 or obb >= t + 4:
+                        continue
+                    if obl < l or obr > r:
+                        stub = True
+                        break
+            if stub:
+                continue
+            candidates.append({
+                "var": info["var"], "span": info["span"], "side": side,
+                "old_val": old_val, "new_val": new_val,
+            })
+    return candidates
+
+
+def apply_grid_rail_fix(script_text, top_cell_var):
+    """Applies find_grid_rail_candidates() for M5 (layer 50, X-axis grid)
+    only. Fully deterministic - see module comment above.
+
+    M6 (layer 60, Y-axis grid, M6.AUX.1) is deliberately NOT included here
+    despite the stub-check finding candidates for it too: cross-block
+    verification (not just Block1) showed the M6.AUX.1 fix is not reliably
+    net-neutral the way it first appeared. On Block1 it traded 1-for-1
+    against a new V5.M6.AUX.2 violation per instance (net zero, harmless).
+    On Block7 the SAME fix traded 24 M6.AUX.1 fixes for 36 new
+    V5.M6.AUX.2 violations (net +12, a real regression) - the ratio isn't
+    fixed 1:1 the way M5's stub-check assumed, and a wrong assumption here
+    was only caught by re-running the real evaluator across every block,
+    not by trusting the single-block result. M6.AUX.1 is deferred, not
+    abandoned - the V5.M6.AUX.2 cascade needs its own investigation before
+    this is safe to ship, the same lesson as M2.S.7/M3.S.2 above.
+    Returns (patched_text, applied_list, skipped_list)."""
+    applied, skipped = [], []
+    all_candidates = find_grid_rail_candidates(script_text, top_cell_var, 50, _M5_GRID_RAW, "x")
+    if not all_candidates:
+        return script_text, applied, skipped
+
+    by_var = {}
+    for c in all_candidates:
+        by_var.setdefault(c["var"], {"span": c["span"], "changes": []})
+        by_var[c["var"]]["changes"].append((c["old_val"], c["new_val"], c["side"]))
+
+    for var, info in sorted(by_var.items(), key=lambda kv: -kv[1]["span"][0]):
+        start, end = info["span"]
+        seg = script_text[start:end]
+        for old_val, new_val, side in info["changes"]:
+            if side in ("left", "right"):
+                new_seg = re.sub(rf"pya\.Point\({old_val}, ", f"pya.Point({new_val}, ", seg)
+            else:
+                new_seg = re.sub(rf", {old_val}\)", f", {new_val})", seg)
+            assert new_seg != seg, f"expected coordinate not found for {var}"
+            seg = new_seg
+        script_text = script_text[:start] + seg + script_text[end:]
+        applied.append(f"{var}: {info['changes']}")
+
+    return script_text, applied, skipped
+
+
+# ---------------------------------------------------------------------------
 # Merge-aware, shape-aware V2.M3.AUX.2 fix.
 #
 # VIA_VIA23_1_3_36_36's 3 V2 vias must each match the TRUE merged M3 extent
@@ -1550,6 +1729,17 @@ def main():
         print(f"[INFO] Skipped grid-alignment (no confirmed-safe shift for this "
               f"pair/row - safe no-op): {grid_skipped}", file=sys.stderr)
     applied = applied + grid_applied
+
+    # M5.AUX.1/M6.AUX.1 grid-rail fix - fully deterministic (see the module
+    # comment above apply_grid_rail_fix(): the stub-check already IS the
+    # safety verification, so there's no ambiguous choice for a model to
+    # make here, unlike M4.S.5 below).
+    patched_script, rail_applied, rail_skipped = apply_grid_rail_fix(patched_script, case_name)
+    applied = applied + rail_applied
+    skipped = skipped + rail_skipped
+    if rail_applied:
+        print(f"[INFO] Applied {len(rail_applied)} M5/M6 grid-rail edit(s): "
+              f"{rail_applied}", file=sys.stderr)
 
     drc_report_path = Path(info.get("path_to_drc_report", ""))
     drc_report = None

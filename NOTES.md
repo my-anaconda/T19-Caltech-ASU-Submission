@@ -1444,3 +1444,146 @@ key exactly as README's Gemini-setup notes warn - had to flip it to
 verification. `agent.py` itself is unaffected (it only ever talks to
 `model_endpoint` via `call_model()`, never imports `google.genai` directly).
 
+## M2.S.7 / M3.S.2 - attempted and reverted, mechanism insufficiently modeled (2026-07-26)
+
+After M4.S.5 shipped, attempted to generalize the same hybrid engine
+("shrink a top-level shape's edge away from a too-close neighbor" - the
+mirror image of M4.S.5's "extend toward a too-far neighbor") to cover
+`M2.S.7` and `M3.S.2`. Built `find_spacing_increase_candidates()` (pure
+regex/bbox, same discipline as `find_m4s5_candidates()`) and verified it
+correctly finds top-level candidates for both rules on Block1: `M2.S.7`
+(2 candidates, `p1301`/`p1297`, each shifting an edge by 4nm) and `M3.S.2`
+(2 independent instances, `p1543`/`p1458`, each shifting an edge by 6nm) -
+`M2.S.1`'s 3 instances correctly produced zero candidates (the only
+available top-level piece is too small - 18nm tall - to shrink without
+inverting; no regression risk there since nothing gets applied).
+
+**Real, full-rule KLayout DRC re-verification (not just the target rule)
+caught that BOTH `M2.S.7` and `M3.S.2` fixes are actually broken:**
+
+- `M2.S.7`: applying either candidate (`p1301` or `p1297`) leaves the
+  target violation count **unchanged (still 1)** - the fix does not
+  resolve what it was meant to fix - while introducing 2 new violations
+  (`M2.S.2` +1, `M2.W.1` +1). Root cause: `M2.S.7` is a genuinely compound
+  condition (`asap7.lydrc`: tip-to-tip 18nm co-located with side-to-side
+  spacing <=32nm is forbidden; parallel run length must be >=35nm when side
+  spacing is tight) - a simple Y-edge shift only addresses the tip-to-tip
+  term and doesn't actually clear the full compound check. This uncertainty
+  was flagged in this fix's own design notes before shipping ("we don't
+  fully model the parallel-run-length alternative") and the real DRC
+  re-run confirmed the concern was correct, not overcautious.
+- `M3.S.2`: applying both candidates ALSO leaves the target violation count
+  unchanged (still 2) while introducing 3 new violations (`V2.AUX.1` +2,
+  `V2.M3.EN.2` +2, and critically **`V2.M3.AUX.2` regressing from 0 -> 2**
+  - a rule this agent's existing merge-aware fix had fully resolved).
+  Root cause: `p1543`/`p1458` (the M3 shapes targeted for trimming)
+  participate in the merged-M3-extent calculation that
+  `apply_dynamic_v2m3_fix()` already depends on for its own via-growth
+  targets - shrinking them retroactively invalidates that calculation,
+  exactly the kind of cross-rule dependency `V1.M2.AUX.2`'s 3-round
+  derivation (see above) already warned generalizes badly.
+
+**Lesson, consistent with the rest of this file's hard-won experience**:
+a bbox-collision-only safety check (sufficient for `M4.S.5`, because M4
+metal in this design doesn't participate in any enclosure/exact-match
+dependency the way M2/M3 do) is NOT sufficient for M2/M3-layer edits -
+those layers interact with spacing, enclosure, and via-width-match rules
+in ways a simple "does the new shape overlap another shape" check cannot
+see. A real fix here would need the same three-independent-safety-
+constraint rigor `V1.M2.AUX.2` required (M2/M3 merge topology, foreign
+shape proximity, and derived-rule dependencies), verified per-candidate
+against a real KLayout DRC re-run before ever being offered to the model
+as "safe" - not assumed from bbox arithmetic alone.
+
+**Not shipped**: `agent.py` was reverted to the pre-attempt (M4.S.5-only)
+state before this was caught - no regression ever reached a committed
+version. `find_spacing_increase_candidates()` and the isolation-testing
+scripts used to catch this are kept in `scripts/tier1_investigation/` as a
+record of what was tried and why it didn't ship. `M2.S.7`/`M3.S.2` are
+deferred, not abandoned - the geometric mechanism needs real per-candidate
+DRC verification before another attempt, not more guessing.
+
+## M5.AUX.1 grid-alignment fix - deterministic, shipped (2026-07-26)
+
+Moved to the next target after the M2.S.7/M3.S.2 setback above: `M5.AUX.1`
+(M5 vertical edges must land on a 24nm grid) - the same `.ongrid()` rule
+family as the already-shipped `M4.AUX.1`, one metal layer up. A much
+earlier investigation (see "What's still open" above) had concluded this
+was intractable: the violating M5 shapes are genuine, block-spanning
+top-level rails (2.7-2.9um tall), not small via-cell pads, and moving one
+seemed to risk the same high-reuse blast radius as `VIA_VIA12`.
+
+Revisited because growing a rail's edge OUTWARD (never shrinking) to the
+nearest grid line is a much smaller, more local change than relocating it -
+and because it's a single top-level polygon, not a shared library cell, so
+the only real risk is a different shape relying on the rail's exact
+current edge position.
+
+**First attempt: a "topmost group" heuristic, and why it was wrong.** An
+early version picked only the off-grid rail group with the minimum Y-start
+(empirically the one safe subset found on Block1 by hand). Cross-block
+verification immediately falsified this: the identical fix, same
+coordinates, regressed Block2 and Block5 by +7 violations each - "topmost"
+was a spurious correlation from Block1's specific layout, not a real
+causal factor. Real per-candidate investigation (live `pya` on the failing
+cases) found the actual mechanism: some via-cell M5 pads (e.g.
+`VIA_VIA45_1_2_58_58`) extend slightly BEYOND the rail's own bbox in Y at
+the exact edge being snapped - growing only the rail (never touching the
+via's own unrelated local pad) leaves that unchanged extension as a new,
+still-off-grid sliver. The target violation count doesn't move, and new
+`M5.AUX.3`/`M5.S.4`/`M5.W.3` violations appear instead. Confirmed as the
+precise, 100%-correlating discriminator across every good/bad case tested
+(Block1's `p1144`/`p1145` vs `p1142`/`p1143`, and Block2's `p938`).
+
+**The shipped fix**: a static "stub check" - for a candidate rail edge,
+does any OTHER shape on the same layer, within the rail's own X-range,
+extend past the rail's Y-range at the edge being moved? Built on the
+existing `_flatten_layer()`/`_transform_bbox()` nested-instance machinery
+(already validated elsewhere in this file for other fixes) - no live
+KLayout needed at grading time, fully derivable from the script text alone.
+A stubbed edge is skipped, not guessed at; this makes the fix fully
+deterministic, unlike `M4.S.5` - there's no ambiguous candidate for a model
+to choose between, the stub check already IS the safety verification.
+
+**Verified end-to-end (real CLI entrypoint, real `evaluate_repair.py`)
+across all 7 blocks:**
+
+| Block | `M5.AUX.1` before | after | `final_violations` | `repair_rate` | connectivity |
+|---|---:|---:|---|---|---|
+| Block1 | 16 | 8 | 153 -> **147** | 0.664 -> 0.668 | true |
+| Block2 | 8 | 4 | 35 -> **32** | 0.677 (same) | true |
+| Block3 | 8 | 0 | 64 -> **58** | 0.573 -> 0.618 | true |
+| Block4 | 12 | 4 | 78 -> **72** | 0.680 -> 0.694 | true |
+| Block5 | (all stub-blocked) | - | 68 -> 68 (no change) | 0.588 (same) | true |
+| Block6 | 16 | 4 | 161 -> **152** | 0.729 -> 0.745 | true |
+| Block7 | 24 | 4 | 492 -> **477** | 0.655 -> 0.665 | true |
+
+Every improved block shows a small `M5.W.3` (width) collateral (1-5
+instances) alongside the fix - always outweighed by the `M5.AUX.1`
+reduction, net positive everywhere, zero connectivity breaks. Block5
+correctly produces zero candidates: every one of its off-grid M5 rails is
+stub-blocked.
+
+**A second regression this same investigation caught, and reverted before
+shipping**: the identical stub-check machinery was first applied to `M6`
+(layer 60, `M6.AUX.1`'s 32nm horizontal-edge grid) too, since the mechanism
+looked identical. On Block1 alone this appeared harmless - `M6.AUX.1` -4
+traded 1-for-1 against a new `V5.M6.AUX.2` +4 (net zero). Cross-block
+verification (again, not just Block1) found this ratio isn't fixed: on
+Block7 the same fix traded 24 `M6.AUX.1` fixes for 36 new `V5.M6.AUX.2`
+violations - a net +12 regression. Removed from the shipped fix
+(`apply_grid_rail_fix` now only ever touches M5, layer 50) before this
+ever reached a commit. `M6.AUX.1` is deferred, not abandoned - the
+`V5.M6.AUX.2` cascade needs its own investigation, most likely the same
+kind of "does a nearby via's own width-match target depend on this rail's
+current position" question the `V2.M3.AUX.2`/`V1.M2.AUX.2` cascades above
+already had to solve.
+
+**The recurring lesson across this whole session's work** (M2.S.7/M3.S.2's
+revert, the "topmost group" false lead, and now the M6 near-miss): a
+single-block result - even one that looks clean - is not evidence of
+safety. Every fix in this file that ships has now been cross-block
+verified against the real evaluator, not assumed to generalize from
+whichever block happened to be tested first.
+
+
