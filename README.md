@@ -259,12 +259,13 @@ Expect `valid_repair: true`, `connectivity_preserved: true` for Block1 in
 every case. The deterministic `M5.AUX.1` grid-rail fix always applies
 regardless of model availability; `final_violation_rate`/`repair_rate`
 additionally reflect the one `M4.S.5` model call (the only non-deterministic
-step in this agent) when it succeeds: `0.6024590...`/`0.6680327...` with the
+step in this agent) when it succeeds: `0.5615.../0.7008...` with the
 model reachable and approving the one safe candidate (confirmed via direct
 local testing, KLayout 0.30.1 via WSL, real `gemini-3.5-flash` call through
-`model_endpoint`), or a slightly smaller improvement if the endpoint is
-unreachable or the model rejects/mis-responds - both are real, valid,
-connectivity-preserved outcomes, never a worse one. The same command
+`model_endpoint` - matches the Block1 row in the results table above exactly),
+or a slightly smaller improvement if the endpoint is unreachable or the model
+rejects/mis-responds - both are real, valid, connectivity-preserved outcomes,
+never a worse one. The same command
 with `--case Block2/Block3/Block4/Block5/Block6/Block7` reproduces the
 corresponding rows in the results table above. See `NOTES.md` for the full
 derivation of these fixes, why the naive floor isn't exactly `1.0`, and what's
