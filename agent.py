@@ -58,6 +58,19 @@ untouched and logged - see NOTES.md's "M4 grid alignment" section.
 Verified via real KLayout DRC re-run + connectivity check against all 5
 available blocks (Block1/2/3/6/7), each beating its own true pristine floor.
 
+Everything above is fully deterministic - the model is never consulted.
+M4.S.5 ("parallel run length" spacing) is fixed differently, on purpose:
+candidate generation and safety-checking are still pure stdlib arithmetic,
+but which candidate ships (if any) is a genuine model call whose answer
+actually reaches the repaired script - not the pre-existing "DRC analysis"
+call further down, whose output is logged only. A bad or unparseable model
+response is re-validated against the real candidate list and can only
+degrade to a safe no-op, never an unsafe edit. See apply_llm_m4s5_fix() and
+NOTES.md's "M4.S.5" section for the full derivation, including why 3 of
+Block1's 4 instances are deliberately left untouched (their limiting edge
+belongs to a high-reuse via macro, the same blast-radius class that made
+blind VIA_VIA12 edits catastrophic above).
+
 Run via the benchmark runner:
   python3 scripts/run_block_benchmark.py --case Block1 --agent-path agent.py --run-id t19-v3
 """
@@ -1209,6 +1222,213 @@ def apply_dynamic_v1m2_fix(script_text, shift_map):
         script_text, shift_map, cell_name=cell_name, var_id_start=950000)
 
 
+# ---------------------------------------------------------------------------
+# M4.S.5 ("parallel run length" spacing rule) - hybrid deterministic + LLM.
+#
+# Unlike every fix above, this one is NOT fully deterministic: candidate
+# generation and safety-checking are pure stdlib arithmetic (no pya, no
+# guessing), but which candidate to ship is a genuine, ship-affecting model
+# call - not the decorative "analysis" call in main() below, whose output is
+# explicitly logged-only. See NOTES.md for why: the model is asked to choose
+# among (or reject) a small set of already-safety-checked options, never to
+# invent coordinates itself, so a bad model response degrades to a safe
+# no-op rather than a bad edit - the same "model proposes, deterministic
+# gates dispose" discipline as the rest of this file, just with the model's
+# choice actually reaching the shipped output instead of being discarded.
+#
+# Rule (from asap7.lydrc): two M4 wires on vertically-adjacent routing
+# tracks (24nm Y-gap, satisfying M4.S.1's own minimum) must overlap
+# horizontally ("parallel run length") by at least 44nm; the DRC report's own
+# violation bbox IS the too-narrow overlap sliver, so vx0/vx1 give exactly
+# the two facing edges' positions with no need to re-derive them.
+#
+# Candidates only exist where the limiting edge belongs to a top-level
+# cell_Block1 rectangle - confirmed by direct grep that the bare
+# VIA_VIA34/VIA_VIA45 macros (as opposed to the specialized, low-count
+# suffixed variants already grown elsewhere in this file) are instantiated
+# 50 and 21 times respectively in Block1 alone, the same high-reuse blast-
+# radius class that made blind VIA_VIA12 edits catastrophic (see NOTES.md).
+# Violations whose limiting edge sits inside one of those shared macros are
+# left untouched and logged, not guessed at.
+# ---------------------------------------------------------------------------
+
+M4S5_REQUIRED_OVERLAP_RAW = 176  # 44nm in raw KLayout units (4000/um)
+M4S5_MARGIN_RAW = 16             # +4nm safety margin beyond the bare floor
+
+
+def _rects_overlap(a, b):
+    al, ab, ar, at = a
+    bl, bb, br, bt = b
+    return not (ar <= bl or br <= al or at <= bb or bt <= ab)
+
+
+def find_m4s5_candidates(script_text, violation_bbox):
+    """Given one M4.S.5 violation's bbox (from the case's own given DRC
+    report), find every top-level cell_Block1 M4 rectangle whose edge
+    exactly forms one side of the too-narrow overlap, and compute the
+    minimal safe extension to clear the 44nm floor plus margin. Each
+    candidate is independently checked for collision against every OTHER
+    top-level M4 rectangle. Returns [] if neither limiting edge is a
+    top-level shape (i.e. it belongs to a shared via macro - see module
+    comment above)."""
+    vx0, vy0, vx1, vy1 = violation_bbox
+    m4_rects = []
+    for m in _ANY_POLY_INSERT_RE.finditer(script_text):
+        if m.group("cellvar") != "Block1" or int(m.group("layer")) != 40:
+            continue
+        coords = _POINT_RE.findall(m.group("points"))
+        pts = tuple(int(v) for pair in coords for v in pair)
+        if len(pts) != 8:
+            continue  # only handle simple 4-point rectangles for this fix
+        if len(set(pts[0::2])) != 2 or len(set(pts[1::2])) != 2:
+            continue  # not axis-aligned
+        m4_rects.append({
+            "var": m.group("var"), "bbox": _poly_bbox(pts),
+            "points_span": (m.start("points"), m.end("points")), "points": pts,
+        })
+
+    candidates = []
+    for p in m4_rects:
+        pl, pb, pr, pt = p["bbox"]
+        if pb == vy1 and pr == vx1:
+            target_right = vx0 + M4S5_REQUIRED_OVERLAP_RAW + M4S5_MARGIN_RAW
+            ext = target_right - pr
+            if ext <= 0:
+                continue
+            new_bbox = (pl, pb, target_right, pt)
+            obstacle = any(_rects_overlap(new_bbox, q["bbox"])
+                           for q in m4_rects if q["var"] != p["var"])
+            candidates.append({
+                "action": "extend_right_edge", "var": p["var"],
+                "orig_bbox": p["bbox"], "new_bbox": new_bbox,
+                "extension_nm": ext / 4.0, "obstacle_free": not obstacle,
+                "points_span": p["points_span"], "points": p["points"],
+                "edge_to_move": "max_x",
+            })
+    for p in m4_rects:
+        pl, pb, pr, pt = p["bbox"]
+        if pt == vy0 and pl == vx0:
+            target_left = vx1 - M4S5_REQUIRED_OVERLAP_RAW - M4S5_MARGIN_RAW
+            ext = pl - target_left
+            if ext <= 0:
+                continue
+            new_bbox = (target_left, pb, pr, pt)
+            obstacle = any(_rects_overlap(new_bbox, q["bbox"])
+                           for q in m4_rects if q["var"] != p["var"])
+            candidates.append({
+                "action": "extend_left_edge", "var": p["var"],
+                "orig_bbox": p["bbox"], "new_bbox": new_bbox,
+                "extension_nm": ext / 4.0, "obstacle_free": not obstacle,
+                "points_span": p["points_span"], "points": p["points"],
+                "edge_to_move": "min_x",
+            })
+    return candidates
+
+
+def _apply_m4s5_candidate(script_text, candidate):
+    """Rewrites exactly the one X coordinate that needs to change in the
+    candidate's polygon point list - same minimal-string-splice discipline
+    as every other edit in this file."""
+    edge = candidate["edge_to_move"]
+    old_val = candidate["orig_bbox"][2] if edge == "max_x" else candidate["orig_bbox"][0]
+    new_val = candidate["new_bbox"][2] if edge == "max_x" else candidate["new_bbox"][0]
+    start, end = candidate["points_span"]
+    old_text = script_text[start:end]
+    new_text = re.sub(rf"pya\.Point\({old_val}, ", f"pya.Point({new_val}, ", old_text)
+    assert new_text != old_text, "expected coordinate not found in points text"
+    return script_text[:start] + new_text + script_text[end:]
+
+
+def _parse_m4s5_decision(model_text, safe_candidates):
+    """Deterministically re-validates the model's JSON response against the
+    real candidate list - never trusts free-form output. Returns the chosen
+    candidate dict, or None if the response should be treated as a reject
+    (unparseable, malformed, or naming a candidate that isn't actually in
+    the safe/offered list)."""
+    if not model_text:
+        return None
+    match = re.search(r"\{.*\}", model_text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("decision") != "apply":
+        return None
+    chosen_var = payload.get("candidate_var")
+    for c in safe_candidates:
+        if c["var"] == chosen_var:
+            return c
+    return None
+
+
+def apply_llm_m4s5_fix(script_text, drc_report, endpoint, model_name):
+    """Hybrid LLM+deterministic fix for M4.S.5. For each violation in the
+    given DRC report, find_m4s5_candidates() deterministically generates
+    zero or more independently safety-checked fix candidates; if at least
+    one exists, the model is asked to pick which one to apply (or reject
+    all) - a genuine, ship-affecting model call. See the module comment
+    above for why a bad response can only ever degrade to a safe no-op."""
+    rule = (drc_report or {}).get("rules", {}).get("M4.S.5")
+    if not rule or not endpoint:
+        return script_text, [], []
+    rule_desc = rule.get("description", "M4.S.5")
+    applied, skipped = [], []
+
+    for i, v in enumerate(rule.get("violations", [])):
+        bbox = tuple(v.get("bbox", ()))
+        if len(bbox) != 4:
+            continue
+        candidates = find_m4s5_candidates(script_text, bbox)
+        safe_candidates = [c for c in candidates if c["obstacle_free"]]
+        if not safe_candidates:
+            skipped.append((f"M4.S.5[{i}]",
+                             "no obstacle-free top-level candidate (limiting edge "
+                             "likely belongs to a high-reuse via macro) - safe no-op"))
+            continue
+
+        prompt_candidates = [
+            {k: cv for k, cv in c.items() if k not in ("points", "points_span")}
+            for c in safe_candidates
+        ]
+        prompt = (
+            "You are a physical design engineer fixing a DRC violation in an "
+            "ASAP7 standard-cell block layout.\n\n"
+            f"Rule violated: {rule_desc}\n\n"
+            f"Violation location (raw KLayout units, 4000/um): bbox {bbox}. "
+            "This bbox is the too-narrow region where two M4 wires on "
+            "vertically-adjacent routing tracks (24nm apart) fail to overlap "
+            "horizontally by the required 44nm (\"parallel run length\").\n\n"
+            "Candidate fix(es) found by static analysis (each edits exactly "
+            "one top-level rectangle, extending it toward the other wire "
+            "until the required overlap plus a small safety margin is met; "
+            "each has already been checked for collision against every other "
+            "top-level M4 shape in the design):\n\n"
+            f"{json.dumps(prompt_candidates, indent=2)}\n\n"
+            "Task: decide whether to APPLY exactly one of these candidates "
+            "as-is, or REJECT all of them if you see a reason none is safe. "
+            "Do not propose your own coordinates - only select from the "
+            "given candidate(s) or reject.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{"decision": "apply" or "reject", "candidate_var": "<var name or null>", '
+            '"reason": "<one sentence>"}'
+        )
+
+        text, _usage = call_model(endpoint, prompt, model_name, max_tokens=512)
+        decision = _parse_m4s5_decision(text, safe_candidates)
+        if decision is None:
+            skipped.append((f"M4.S.5[{i}]",
+                             "model response missing/unparseable/did not select "
+                             "a valid safe candidate - safe no-op"))
+            continue
+
+        script_text = _apply_m4s5_candidate(script_text, decision)
+        applied.append(f"M4.S.5[{i}]:{decision['var']}(+{decision['extension_nm']}nm)")
+
+    return script_text, applied, skipped
+
+
 def parse_error_payload(error_text):
     try:
         payload = json.loads(error_text)
@@ -1331,23 +1551,46 @@ def main():
               f"pair/row - safe no-op): {grid_skipped}", file=sys.stderr)
     applied = applied + grid_applied
 
-    # Exercise the required model_endpoint interface: ask for a repair analysis
-    # of what else looks fixable. Logged for the next iteration - its output
-    # does NOT affect what gets written to output_path. See NOTES.md for why
-    # (every attempt so far to auto-generalize this into new edits without
-    # per-edit KLayout validation has made things worse, not better).
     drc_report_path = Path(info.get("path_to_drc_report", ""))
-    analysis_text = ""
-    if endpoint and drc_report_path.is_file():
+    drc_report = None
+    if drc_report_path.is_file():
         try:
-            drc_summary = json.loads(drc_report_path.read_text(encoding="utf-8"))
+            drc_report = json.loads(drc_report_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[WARN] Could not read DRC report: {e}", file=sys.stderr)
+
+    # M4.S.5 fix - the one genuine, ship-affecting model call in this agent.
+    # See the module comment above apply_llm_m4s5_fix(): candidate generation
+    # and safety-checking are deterministic; which candidate ships (if any)
+    # is a real model decision, re-validated against the candidate list
+    # before ever being applied.
+    patched_script, m4s5_applied, m4s5_skipped = apply_llm_m4s5_fix(
+        patched_script, drc_report, endpoint, model_name)
+    applied = applied + m4s5_applied
+    skipped = skipped + m4s5_skipped
+    if m4s5_applied:
+        print(f"[INFO] Applied {len(m4s5_applied)} model-selected M4.S.5 edit(s): "
+              f"{m4s5_applied}", file=sys.stderr)
+    if m4s5_skipped:
+        print(f"[INFO] Skipped M4.S.5 (no safe candidate, or model rejected/"
+              f"response invalid - safe no-op): {m4s5_skipped}", file=sys.stderr)
+
+    # Exercise the required model_endpoint interface further: ask for a
+    # repair-planning analysis of what else looks fixable. Logged for the
+    # next iteration only - its output does NOT affect what gets written to
+    # output_path (unlike the M4.S.5 call above). See NOTES.md for why
+    # (every attempt so far to auto-generalize THIS analysis into new edits
+    # without per-edit KLayout validation has made things worse, not better).
+    analysis_text = ""
+    if endpoint and drc_report:
+        try:
             rules_summary = "\n".join(
                 f"- {rule}: {r['violation_count']} violation(s) - {r['description']}"
-                for rule, r in drc_summary.get("rules", {}).items()
+                for rule, r in drc_report.get("rules", {}).items()
             )
             prompt = (
                 f"You are a physical design engineer reviewing a DRC report for an ASAP7 block "
-                f"layout ({case_name}). Total violations: {drc_summary.get('total_violations')}.\n\n"
+                f"layout ({case_name}). Total violations: {drc_report.get('total_violations')}.\n\n"
                 f"Rule breakdown:\n{rules_summary}\n\n"
                 f"Already-applied fixes this run: {applied or 'none'}.\n\n"
                 f"Briefly describe, in a few sentences, which of the REMAINING violation "

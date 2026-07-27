@@ -1326,3 +1326,121 @@ session's convention. Round 1: `gen_def.py`, `gen_def_nets.py`,
 `~/openroad_work/` (the docker-mounted OpenROAD working directory). None of
 this lives in `agent.py` - it's kept only as a record of what was tried and
 why it didn't ship.
+
+## M4.S.5 ("parallel run length") - first hybrid LLM+deterministic fix (2026-07-26)
+
+After reverting to the surgical agent per the OpenROAD investigation above,
+picked a never-yet-attempted rule from the current 154-violation residual
+and fixed it - deliberately as a genuine hybrid, not another fully-
+deterministic pattern, per explicit instruction: this benchmark's own
+scoring setup is understood to weigh real model usage, and a fully
+deterministic submission (candidate architecture seen elsewhere at this
+hackathon: use the model offline to find a static transform, then ship an
+agent that never calls it at runtime) would be leaving that on the table.
+
+### Rule mechanics (derived from `asap7.lydrc`, not guessed)
+
+```
+m4_s5_prl_gap = m4.edges.with_angle(0).space(24.nm + 1.dbu, projection).polygons.not(m4)
+m4_s5_prl_gap.with_bbox_height(24.nm).width(44.nm, projection).with_angle(90)
+  .output("M4.S.5", "... Minimum parallel run length of two M4 layer
+  polygons on adjacent tracks is 44 nm.")
+```
+
+Two M4 wires on vertically-adjacent routing tracks (24nm Y-gap, satisfying
+`M4.S.1`'s own minimum spacing) must overlap horizontally ("parallel run
+length") by at least 44nm; violating instances are the too-narrow overlap
+sliver. Confirmed against Block1's real `.lyrpt` DRC output via live
+`pya.Region` queries before writing any fix code: for all 4 of Block1's
+`M4.S.5` violations, the "below"/"above" merged M4 regions at the gap band
+are each a merge of one top-level `cell_Block1` rectangle plus one or two
+`VIA_VIA34`/`VIA_VIA45` via-macro pads (confirmed via
+`pya.RecursiveShapeIterator` cell-by-cell, not assumed).
+
+**Critical, easily-missed fact confirmed before writing any runtime code**:
+the case's own given `path_to_drc_report` (e.g.
+`testcase/asap7/block/drc_report/Block1.drc.json`) already carries the
+exact violation bbox for every `M4.S.5` instance under `"violations": [{"type":
+"edge_pair", "bbox": [...]}]` - identical to what a live KLayout re-run's
+`.lyrpt` reports. This matters because the **official submission image has
+no KLayout binary at all** (`python:3.10-slim`, confirmed via
+`official_eval/Dockerfile` in the problems repo) - `agent.py` can never
+import `pya` at grading time. Since the exact geometry is already available
+from the given DRC report as plain JSON, the entire candidate-generation and
+safety-check pipeline could be built as pure regex/bbox arithmetic on the
+script text (reusing this file's existing `_ANY_POLY_INSERT_RE`/`_POINT_RE`
+machinery) with zero `pya` dependency - verified to reproduce the live-`pya`
+result exactly before trusting it.
+
+### Why only 1 of Block1's 4 instances gets a safe candidate
+
+For each violation, `find_m4s5_candidates()` looks for a top-level
+`cell_Block1` rectangle whose edge exactly forms one side of the
+violation's bbox (i.e. is the actual limiting edge, not just something
+nearby) and computes the minimal extension (to 44nm + 4nm margin) needed,
+independently checked for collision against every other top-level M4
+rectangle. Only violation 0 has one: extending `p1214`'s right edge by
+47nm, from `(2132,7296,2264,7392)` to `(2132,7296,2452,7392)`, obstacle-free.
+The other 3 instances' limiting edges belong to the BARE `VIA_VIA34`/
+`VIA_VIA45` macros (not the specialized, low-instance-count suffixed
+variants like `VIA_VIA45_1_2_58_58` already grown safely elsewhere in this
+file) - confirmed via direct grep: 50 and 21 instances respectively in
+Block1 alone, the same high-reuse blast-radius class that made blind
+`VIA_VIA12` edits catastrophic (see "Fixes that didn't work" above). These
+3 are deliberately left untouched and logged, not guessed at - fixing them
+for real needs the same per-instance-context-aware hierarchy machinery
+already flagged as "not yet built" for the other deferred rules.
+
+### The hybrid mechanism itself
+
+`find_m4s5_candidates()` (pure stdlib, deterministic) generates zero or
+more independently safety-checked candidates per violation. Where at least
+one exists, `apply_llm_m4s5_fix()` makes a genuine model call - not the
+pre-existing decorative "DRC analysis" call further down in `main()`, whose
+output is explicitly logged-only and never affects `output_path`. The
+model is given the rule text, the violation's exact geometry, and the full
+candidate list (each already tagged `obstacle_free: true/false`), and asked
+to either APPLY exactly one named candidate or REJECT all of them - it is
+never asked to invent its own coordinates. `_parse_m4s5_decision()`
+re-validates the response against the real candidate list before ever
+touching the script: an empty response, a JSON parse failure, a malformed
+payload, or a `candidate_var` that doesn't match a real safety-checked
+candidate are ALL treated as reject (safe no-op). This means a bad or
+missing model response can only ever degrade to what the agent would have
+shipped anyway - the same "model proposes, deterministic gates dispose"
+discipline as the rest of this file, except here the model's choice
+actually reaches the shipped output instead of being discarded.
+
+### Verification (real model call, real KLayout, all 7 blocks)
+
+Ran `agent.py`'s actual CLI entrypoint end-to-end against a local
+`model_service.py` instance (real `gemini-3.5-flash` call through
+`model_endpoint`, not a stub) for all 7 blocks, followed by real
+`evaluate_repair.py`:
+
+| Block | `M4.S.5` before | `M4.S.5` after | model action | connectivity_preserved |
+|---|---:|---:|---|---|
+| Block1 | 4 | **3** | applied `p1214` (+47nm) | true |
+| Block2 | 1 | 1 | rejected (no safe candidate) | true |
+| Block3 | 0 | 0 | n/a | true |
+| Block4 | 2 | 2 | rejected both (no safe candidate) | true |
+| Block5 | 0 | 0 | n/a | true |
+| Block6 | 0 | 0 | n/a | true |
+| Block7 | 1 | 1 | rejected (no safe candidate) | true |
+
+Block1: `final_violation_rate` 0.6311475... -> **0.6270491...**, `repair_rate`
+0.6639344... -> **0.6680327...**, `missing_connectivity_sources` still 0,
+`new_violations` unchanged at 72 (zero collateral). Every other block:
+byte-identical scores to the pre-fix baseline (`valid_repair`,
+`connectivity_preserved`, `final_violation_rate`, `repair_rate` all
+unchanged) - a strict, monotonic improvement with zero regression anywhere,
+exactly the standard the rest of this file holds every fix to.
+
+Also confirmed one operational gotcha along the way: this WSL environment's
+`scripts/model_service.py` hardcodes `vertexai=True` in `build_client()`,
+which 403s (`API_KEY_SERVICE_BLOCKED`) against this project's AI-Studio-style
+key exactly as README's Gemini-setup notes warn - had to flip it to
+`vertexai=False` locally to actually exercise the real call for this
+verification. `agent.py` itself is unaffected (it only ever talks to
+`model_endpoint` via `call_model()`, never imports `google.genai` directly).
+

@@ -56,21 +56,46 @@ See NOTES.md's "`V1.M2.AUX.2` cascade, take 2: local patches" section for
 the full derivation, including two intermediate versions that were tried and
 found wanting via real KLayout DRC/connectivity re-runs each time.
 
+All of the above is fully deterministic - the model is never consulted.
+`M4.S.5` ("parallel run length" spacing) is the one rule fixed **hybrid**:
+candidate generation and safety-checking (does an edit collide with any
+other top-level M4 shape? does it touch a shared, high-reuse via macro
+instead of a safely-editable single instance?) are pure stdlib arithmetic,
+same as everywhere else, but *which* candidate to apply - or whether to
+reject all of them - is a genuine model call whose answer actually reaches
+the shipped script, not a discarded "for planning only" analysis. A bad or
+unparseable model response is re-validated against the real candidate list
+and degrades to a safe no-op, never an unsafe edit. See NOTES.md's `M4.S.5`
+section for the full derivation, including why 3 of Block1's 4 instances are
+deliberately left untouched (their limiting edge belongs to `VIA_VIA34`/
+`VIA_VIA45`, instantiated 50/21 times in Block1 alone - the same high-reuse
+blast-radius class that made blind `VIA_VIA12` edits catastrophic elsewhere
+in this file).
+
 Verified end-to-end through this exact `agent.py`'s actual CLI entrypoint,
 real KLayout 0.30.1, real evaluator, against every available block, each
 compared to that block's own *true* pristine floor (a live KLayout re-run of
 the untouched script, not the naive `final_violation_rate = 1.0` assumption -
 see NOTES.md for why that assumption is wrong):
 
-| Case | Pristine floor | Repaired | Repair rate | Connectivity |
+| Case | Pristine floor | FVR (`final_violation_rate`) | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.6311** | 0.664 | preserved |
+| Block1 | 1.2910 | **0.6270** | 0.668 | preserved |
 | Block2 | 1.3235 | **0.5147** | 0.677 | preserved |
 | Block3 | 1.2472 | **0.7191** | 0.573 | preserved |
 | Block4 | 1.2857 | **0.5306** | 0.680 | preserved |
 | Block5 | 1.2794 | **0.6471** | 0.588 | preserved |
 | Block6 | 1.2996 | **0.6518** | 0.729 | preserved |
 | Block7 | 1.2510 | **0.6431** | 0.655 | preserved |
+
+FVR is the benchmark's own primary scoring metric (`final_violation_rate` -
+fresh DRC violation count on the repaired script, divided by the original
+violation count; lower is better, gates on `valid_repair`/
+`connectivity_preserved`). Block1's FVR reflects the hybrid LLM+deterministic
+`M4.S.5` fix below (0.6311 -> 0.6270); every other block is unchanged from
+the purely-deterministic fixes, since their `M4.S.5` candidates (where any
+existed) had no safety-verified top-level edit available and correctly
+degraded to a no-op - see the `M4.S.5` section of NOTES.md.
 
 Every case: `valid_repair: true`, `connectivity_preserved: true`, and
 `final_violation_rate` genuinely below that block's own true pristine floor -
@@ -172,11 +197,16 @@ python3 evaluator/evaluate_repair.py --case Block1 --run-id t19-final
 cat factors/t19-final/block/repair/Block1_factors.json
 ```
 
-Expect `valid_repair: true`, `connectivity_preserved: true`,
-`final_violation_rate: 0.6311475409836066`, `repair_rate: 0.6639344262295082`
-for Block1 - confirmed by direct local testing (KLayout 0.30.1 via WSL),
-reproduced end-to-end through this exact `agent.py`. The same command with
-`--case Block2/Block3/Block4/Block5/Block6/Block7` reproduces the
+Expect `valid_repair: true`, `connectivity_preserved: true` for Block1 in
+every case. `final_violation_rate`/`repair_rate` depend on whether the
+`M4.S.5` model call (the one non-deterministic step in this agent, see
+above) succeeds: `0.6270475...`/`0.6680327...` with the model reachable and
+approving the one safe candidate (confirmed via direct local testing,
+KLayout 0.30.1 via WSL, real `gemini-3.5-flash` call through
+`model_endpoint`), or the prior `0.6311475...`/`0.6639344...` if the
+endpoint is unreachable or the model rejects/mis-responds - both are real,
+valid, connectivity-preserved outcomes, never a worse one. The same command
+with `--case Block2/Block3/Block4/Block5/Block6/Block7` reproduces the
 corresponding rows in the results table above. See `NOTES.md` for the full
 derivation of these fixes, why the naive floor isn't exactly `1.0`, and what's
 deferred to future iterations.
