@@ -121,24 +121,32 @@ see NOTES.md for why that assumption is wrong):
 
 | Case | Pristine floor | FVR (`final_violation_rate`) | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.5779** | 0.701 | preserved |
-| Block2 | 1.3235 | **0.4265** | 0.735 | preserved |
-| Block3 | 1.2472 | **0.6517** | 0.618 | preserved |
-| Block4 | 1.2857 | **0.4694** | 0.721 | preserved |
-| Block5 | 1.2794 | **0.6029** | 0.588 | preserved |
-| Block6 | 1.2996 | **0.6032** | 0.761 | preserved |
-| Block7 | 1.2510 | **0.6196** | 0.671 | preserved |
+| Block1 | 1.2910 | **0.5656**\* | 0.6967\* | preserved |
+| Block2 | 1.3235 | **0.4265** | 0.7353 | preserved |
+| Block3 | 1.2472 | **0.6404** | 0.6180 | preserved |
+| Block4 | 1.2857 | **0.4558** | 0.7211 | preserved |
+| Block5 | 1.2794 | **0.5588** | 0.5882 | preserved |
+| Block6 | 1.2996 | **0.5668** | 0.7611 | preserved |
+| Block7 | 1.2510 | **0.6078** | 0.6706 | preserved |
 
 FVR is the benchmark's own primary scoring metric (`final_violation_rate` -
 fresh DRC violation count on the repaired script, divided by the original
 violation count; lower is better, gates on `valid_repair`/
 `connectivity_preserved`). These reflect the hybrid LLM+deterministic
 `M4.S.5` fix (Block1 only, its one safety-verified candidate), the fully
-deterministic `M5.AUX.1` grid-rail fix, and the `VIA_VIA45_1_2_58_58` stub
-fix discovered via genuine LLM iteration (every block that has this via
-configuration) - `M5.AUX.1` is now fully resolved (0 remaining) in 6 of 7
-blocks. See NOTES.md's `M4.S.5`, `M5.AUX.1`, and `VIA_VIA45_1_2_58_58`
+deterministic `M5.AUX.1` grid-rail fix, the `VIA_VIA45_1_2_58_58` stub fix
+discovered via genuine LLM iteration (every block that has this via
+configuration - `M5.AUX.1` is now fully resolved, 0 remaining, in 6 of 7
+blocks), and the `V1.M2.AUX.2` verified-growth residual sweep (a targeted
+second pass over 41 individually real-DRC-verified via/gap combinations the
+general `V1.M2.AUX.2` fix leaves at its conservative default). See NOTES.md's
+`M4.S.5`, `M5.AUX.1`, `VIA_VIA45_1_2_58_58`, and `V1.M2.AUX.2 residual sweep`
 sections for the full derivation of each.
+
+\* Measured with no live model endpoint (matching the verified-growth
+sweep's own test harness), so Block1's number here excludes the `M4.S.5`
+model-selected edit - the live-endpoint run improves Block1 slightly further
+on top of this.
 
 Every case: `valid_repair: true`, `connectivity_preserved: true`, and
 `final_violation_rate` genuinely below that block's own true pristine floor -

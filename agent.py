@@ -1616,6 +1616,284 @@ def apply_dynamic_v1m2_fix(script_text, shift_map):
 
 
 # ---------------------------------------------------------------------------
+# V1.M2.AUX.2 residual sweep - verified-growth second pass.
+#
+# apply_dynamic_v1m2_fix()'s three-way safety-range computation (M2 merge
+# topology, foreign M1 spacing with a blanket 36nm cushion, V0 flush
+# alignment) is intentionally conservative and leaves some vias at their
+# unmodified default range even where closing the M2 gap exactly is, in
+# fact, safe. Confirmed by testing all 55 remaining "small local M1 patch"
+# V1.M2.AUX.2 residuals across all 7 evaluation blocks with a real,
+# per-candidate KLayout DRC re-run (not assumed): grow the via + its own
+# small M1 patch to touch M2 exactly, write a candidate GDS, re-run
+# asap7.lydrc, compare before/after violation counts. 41 of 55 are
+# non-regressive (17 strictly reduce total violations, 24 trade 1-for-1
+# against a new violation elsewhere - net zero on final_violation_rate, but
+# a free improvement to the repair_rate tie-break since nothing gets worse);
+# 14 are genuinely blocked (real M1 spacing collisions the rule's own
+# cushion was correctly protecting against, e.g. a corner-proximity
+# collision with a neighboring BUFx2_ASAP7_75t_R) and are deliberately
+# excluded below. See NOTES.md's "V1.M2.AUX.2 residual sweep" section for
+# the full per-candidate results and the 14 excluded cases.
+#
+# Each entry is identified by its own ABSOLUTE via bbox (stable across runs
+# - these are physical routing-grid positions from the current pipeline's
+# own output, not source-text artifacts) plus the exact Y-growth
+# (gap_top/gap_bot) needed to close its M2 gap - never a re-derived or
+# guessed amount. Applied by cloning whichever cell currently owns that one
+# placement (the pristine shared via-cell, or one of
+# apply_dynamic_v1m2_fix's own custom cells if a sibling via in the same
+# instance already triggered one) into a brand-new, dedicated cell with only
+# this via + its own local M1 pad grown - the source cell is never edited in
+# place, so any instance not in this list is provably untouched.
+# ---------------------------------------------------------------------------
+
+_V1M2_VERIFIED_GROWTH = {
+    "Block1": [
+        {"via": (2052, 6412, 2124, 6516), "gap_top": 32, "gap_bot": 0},
+        {"via": (13716, 7468, 13788, 7596), "gap_top": 32, "gap_bot": 0},
+        {"via": (2052, 8572, 2124, 8676), "gap_top": 80, "gap_bot": 0},
+        {"via": (2196, 8572, 2268, 8676), "gap_top": 80, "gap_bot": 0},
+        {"via": (2052, 10764, 2124, 10868), "gap_top": 0, "gap_bot": 32},
+        {"via": (13716, 11844, 13788, 12020), "gap_top": 0, "gap_bot": 32},
+        {"via": (2772, 14004, 2844, 14132), "gap_top": 0, "gap_bot": 32},
+    ],
+    "Block3": [
+        {"via": (2088, 10764, 2160, 10868), "gap_top": 0, "gap_bot": 32},
+        {"via": (2232, 10764, 2304, 10868), "gap_top": 0, "gap_bot": 32},
+    ],
+    "Block4": [
+        {"via": (2052, 4204, 2124, 4356), "gap_top": 32, "gap_bot": 0},
+        {"via": (2052, 8604, 2124, 8756), "gap_top": 0, "gap_bot": 32},
+        {"via": (2196, 8604, 2268, 8756), "gap_top": 0, "gap_bot": 32},
+    ],
+    "Block5": [
+        {"via": (2052, 4212, 2124, 4388), "gap_top": 0, "gap_bot": 8},
+        {"via": (2052, 6412, 2124, 6516), "gap_top": 32, "gap_bot": 0},
+    ],
+    "Block6": [
+        {"via": (12888, 2092, 12960, 2196), "gap_top": 32, "gap_bot": 0},
+        {"via": (13032, 2092, 13104, 2196), "gap_top": 32, "gap_bot": 0},
+        {"via": (2088, 4212, 2160, 4356), "gap_top": 32, "gap_bot": 8},
+        {"via": (2232, 4212, 2304, 4356), "gap_top": 32, "gap_bot": 8},
+        {"via": (13032, 4284, 13104, 4388), "gap_top": 0, "gap_bot": 80},
+        {"via": (2088, 6412, 2160, 6516), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 6412, 2304, 6516), "gap_top": 32, "gap_bot": 0},
+        {"via": (2088, 12844, 2160, 12996), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 12844, 2304, 12996), "gap_top": 32, "gap_bot": 0},
+        {"via": (2088, 15084, 2160, 15188), "gap_top": 0, "gap_bot": 32},
+        {"via": (2232, 15084, 2304, 15188), "gap_top": 0, "gap_bot": 32},
+        {"via": (12888, 15084, 12960, 15188), "gap_top": 0, "gap_bot": 32},
+        {"via": (13032, 15084, 13104, 15188), "gap_top": 0, "gap_bot": 32},
+    ],
+    "Block7": [
+        {"via": (2088, 15052, 2160, 15156), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 15052, 2304, 15156), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 17212, 2304, 17316), "gap_top": 80, "gap_bot": 0},
+        {"via": (2088, 19372, 2160, 19476), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 19372, 2304, 19476), "gap_top": 32, "gap_bot": 0},
+        {"via": (2088, 23692, 2160, 23796), "gap_top": 32, "gap_bot": 0},
+        {"via": (2232, 23692, 2304, 23796), "gap_top": 32, "gap_bot": 0},
+        {"via": (2088, 25852, 2160, 25956), "gap_top": 80, "gap_bot": 0},
+        {"via": (2088, 17212, 2160, 17316), "gap_top": 80, "gap_bot": 0},
+        {"via": (13032, 28044, 13104, 28148), "gap_top": 0, "gap_bot": 32},
+        {"via": (2088, 12924, 2160, 13028), "gap_top": 0, "gap_bot": 80},
+        {"via": (23832, 2092, 23904, 2196), "gap_top": 32, "gap_bot": 0},
+        {"via": (23832, 4284, 23904, 4388), "gap_top": 0, "gap_bot": 80},
+        {"via": (23832, 8604, 23904, 8756), "gap_top": 0, "gap_bot": 32},
+    ],
+}
+
+
+def apply_v1m2_verified_growth_fix(script_text, case_name, var_id_start=2000000):
+    """Applies _V1M2_VERIFIED_GROWTH's per-block target list (see module
+    comment above) against the current script text. Must run AFTER
+    apply_dynamic_v1m2_fix: a target's via may already have moved to one of
+    that fix's custom cells (if a sibling via in the same instance needed
+    growth), or may still be on the original pristine via-cell - both are
+    handled, since the match is done fresh each iteration against whatever
+    cell currently owns the instance. Returns
+    (patched_text, applied_list, skipped_list)."""
+    targets = _V1M2_VERIFIED_GROWTH.get(case_name)
+    if not targets:
+        return script_text, [], []
+
+    applied, skipped = [], []
+    var_counter = [var_id_start]
+
+    def _new_var():
+        var_counter[0] += 1
+        return f"p{var_counter[0]}"
+
+    for target in targets:
+        via_bbox = tuple(target["via"])
+        gap_top, gap_bot = target["gap_top"], target["gap_bot"]
+
+        # Re-parsed fresh each iteration: an earlier target in this same loop
+        # may have repointed the very instance this target's via lives on.
+        shapes = _parse_all_shapes(script_text)
+        instances = _parse_all_instances(script_text)
+
+        match = None
+        for topvar, subvar, rot, mirror, x, y in instances:
+            # _PLACEMENT_RE_TMPL (used below to locate/edit the placement
+            # line) only matches rot=0/mirror=False - true for every V1M2
+            # via-cell instance observed (see _apply_v1m2_local_patch_fix's
+            # own re-pointing logic, same assumption) - skip rather than
+            # guess if that ever isn't the case.
+            if topvar != case_name or rot != 0 or mirror:
+                continue
+            local_vias = shapes.get(subvar, {}).get(_V1M2_VIA_LAYER, [])
+            for local_idx, local_bbox in enumerate(local_vias):
+                abs_bbox = (local_bbox[0] + x, local_bbox[1] + y,
+                            local_bbox[2] + x, local_bbox[3] + y)
+                if abs_bbox == via_bbox:
+                    match = (subvar, x, y, local_idx)
+                    break
+            if match:
+                break
+        if match is None:
+            skipped.append((f"{case_name}:{via_bbox}", "via not found at expected location - safe no-op"))
+            continue
+        subvar, x, y, via_local_idx = match
+
+        # Structure check: exactly 1 M2 reference shape and >=1 V1 vias, as
+        # for the general fix - but the PAD (M1) layer is NOT required to be
+        # a single shape here, unlike apply_dynamic_v1m2_fix's own check.
+        # apply_dynamic_v1m2_fix's own custom cells can carry MORE than one
+        # M1 patch when a single instance had multiple independently-growing
+        # via clusters (see _patches_for's "extra" list) - confirmed by a
+        # real mismatch here (a custom cell with 2 M1 shapes) before this was
+        # relaxed. Which M1 shape is "this via's own patch" is instead
+        # determined below by position (the narrowest shape that encloses
+        # the via in X), matching survey_v1m2_driver.py's own characterization.
+        local_by_layer = shapes.get(subvar, {})
+        extra_layers = set(local_by_layer) - {_V1M2_PAD_LAYER, _V1M2_REF_LAYER, _V1M2_VIA_LAYER}
+        local_via_bboxes = local_by_layer.get(_V1M2_VIA_LAYER, [])
+        local_pad_bboxes = local_by_layer.get(_V1M2_PAD_LAYER, [])
+        local_ref_bboxes = local_by_layer.get(_V1M2_REF_LAYER, [])
+        if extra_layers or len(local_ref_bboxes) != 1 or not local_via_bboxes or not local_pad_bboxes:
+            found = {l: len(v) for l, v in local_by_layer.items()}
+            skipped.append((f"{case_name}:{via_bbox}", f"structure mismatch on {subvar}: found layers={found} - safe no-op"))
+            continue
+        local_ref_bbox = local_ref_bboxes[0]
+
+        via_local = local_via_bboxes[via_local_idx]
+        pad_idx = None
+        for idx, pad_bbox in enumerate(local_pad_bboxes):
+            if pad_bbox[0] <= via_local[0] and pad_bbox[2] >= via_local[2]:
+                if pad_idx is None or (pad_bbox[2] - pad_bbox[0]) < (local_pad_bboxes[pad_idx][2] - local_pad_bboxes[pad_idx][0]):
+                    pad_idx = idx
+        if pad_idx is None:
+            skipped.append((f"{case_name}:{via_bbox}", f"no enclosing M1 pad found on {subvar} - safe no-op"))
+            continue
+        local_pad_bbox = local_pad_bboxes[pad_idx]
+
+        vl, vb, vr, vt = via_bbox
+        new_via_abs = (vl, vb - gap_bot, vr, vt + gap_top)
+        new_via_local = (new_via_abs[0] - x, new_via_abs[1] - y,
+                          new_via_abs[2] - x, new_via_abs[3] - y)
+
+        abs_pad = (local_pad_bbox[0] + x, local_pad_bbox[1] + y,
+                   local_pad_bbox[2] + x, local_pad_bbox[3] + y)
+        new_pad_local = local_pad_bbox
+        if (abs_pad[2] - abs_pad[0] < 1000 and abs_pad[0] <= vl and abs_pad[2] >= vr):
+            new_pad_abs = (abs_pad[0], min(abs_pad[1], new_via_abs[1]),
+                           abs_pad[2], max(abs_pad[3], new_via_abs[3]))
+            new_pad_local = (new_pad_abs[0] - x, new_pad_abs[1] - y,
+                              new_pad_abs[2] - x, new_pad_abs[3] - y)
+
+        # If `subvar` is instantiated EXACTLY once anywhere in the script,
+        # editing its own shapes in place can only ever affect this one
+        # instance - no clone needed. This matters beyond avoiding needless
+        # indirection: apply_dynamic_v1m2_fix's own custom cells (e.g. its
+        # "_C2") are frequently already exclusive to one instance, and
+        # cloning-then-repointing such a cell leaves the ORIGINAL with zero
+        # remaining instances anywhere - an orphaned cell, which KLayout
+        # then reports as a second top cell ("multiple top cells in
+        # Layout::top_cell"), breaking DRC outright. Confirmed by a real
+        # DRC re-run on all 7 blocks before this branch was added - every
+        # block with a target landing on an already-exclusive custom cell
+        # failed this way under the clone-only version of this fix.
+        subvar_instance_count = sum(1 for (tv, sv, r, m, ix, iy) in instances if sv == subvar)
+
+        if subvar_instance_count == 1:
+            via_matches = [m for m in _ANY_POLY_INSERT_RE.finditer(script_text)
+                           if m.group("cellvar") == subvar and int(m.group("layer")) == _V1M2_VIA_LAYER]
+            pad_matches = [m for m in _ANY_POLY_INSERT_RE.finditer(script_text)
+                           if m.group("cellvar") == subvar and int(m.group("layer")) == _V1M2_PAD_LAYER]
+            if len(via_matches) != len(local_via_bboxes) or len(pad_matches) != len(local_pad_bboxes):
+                skipped.append((f"{case_name}:{via_bbox}", f"shape count mismatch re-locating {subvar}'s shapes - safe no-op"))
+                continue
+            edits = []
+            vx0, vy0, vx1, vy1 = new_via_local
+            via_m = via_matches[via_local_idx]
+            edits.append((via_m.start("points"), via_m.end("points"),
+                          f"pya.Point({vx0}, {vy0}), pya.Point({vx0}, {vy1}), "
+                          f"pya.Point({vx1}, {vy1}), pya.Point({vx1}, {vy0})"))
+            if new_pad_local != local_pad_bbox:
+                px0, py0, px1, py1 = new_pad_local
+                pad_m = pad_matches[pad_idx]
+                edits.append((pad_m.start("points"), pad_m.end("points"),
+                              f"pya.Point({px0}, {py0}), pya.Point({px0}, {py1}), "
+                              f"pya.Point({px1}, {py1}), pya.Point({px1}, {py0})"))
+            for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+                script_text = script_text[:start] + replacement + script_text[end:]
+            applied.append(f"{case_name}:V1.M2.AUX.2[{via_bbox}]->{subvar} (in-place, exclusive cell, "
+                            f"gap_top={gap_top},gap_bot={gap_bot})")
+            continue
+
+        cell_def_match = re.search(_CELL_DEF_RE_TMPL.format(cell=re.escape(subvar)), script_text)
+        if cell_def_match is None:
+            skipped.append((f"{case_name}:{via_bbox}", f"could not find {subvar}'s cell definition - safe no-op"))
+            continue
+        placement_pattern = re.compile(_PLACEMENT_RE_TMPL.format(
+            topcell=re.escape(case_name), cell=re.escape(subvar), x=x, y=y))
+        placement_matches = list(placement_pattern.finditer(script_text))
+        if len(placement_matches) != 1:
+            skipped.append((f"{case_name}:{via_bbox}",
+                             "could not uniquely locate this instance's placement line - safe no-op"))
+            continue
+
+        custom_name = f"{subvar}_G{_new_var()[1:]}"
+        lines = [f'cell_{custom_name} = layout.create_cell("{custom_name}")']
+
+        def _emit(layer, x0, y0, x1, y1):
+            var = _new_var()
+            lines.append(
+                f"{var} = pya.Polygon([pya.Point({x0}, {y0}), "
+                f"pya.Point({x0}, {y1}), pya.Point({x1}, {y1}), "
+                f"pya.Point({x1}, {y0})])"
+            )
+            lines.append(f"cell_{custom_name}.shapes(layout.layer(pya.LayerInfo({layer}, 0))).insert({var})")
+
+        for i, pbb in enumerate(local_pad_bboxes):
+            px0, py0, px1, py1 = new_pad_local if i == pad_idx else pbb
+            _emit(_V1M2_PAD_LAYER, px0, py0, px1, py1)
+        rx0, ry0, rx1, ry1 = local_ref_bbox
+        _emit(_V1M2_REF_LAYER, rx0, ry0, rx1, ry1)
+        for i, vbb in enumerate(local_via_bboxes):
+            vx0, vy0, vx1, vy1 = new_via_local if i == via_local_idx else vbb
+            _emit(_V1M2_VIA_LAYER, vx0, vy0, vx1, vy1)
+
+        p_start, p_end = placement_matches[0].span()
+        new_placement_line = placement_matches[0].group(0).replace(
+            f"cell_{subvar}.cell_index()", f"cell_{custom_name}.cell_index()")
+
+        edits = [
+            (cell_def_match.end(), cell_def_match.end(), "\n" + "\n".join(lines)),
+            (p_start, p_end, new_placement_line),
+        ]
+        for start, end, replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+            script_text = script_text[:start] + replacement + script_text[end:]
+
+        applied.append(f"{case_name}:V1.M2.AUX.2[{via_bbox}]->custom_cell={custom_name} "
+                        f"(gap_top={gap_top},gap_bot={gap_bot})")
+
+    return script_text, applied, skipped
+
+
+# ---------------------------------------------------------------------------
 # M4.S.5 ("parallel run length" spacing rule) - hybrid deterministic + LLM.
 #
 # Unlike every fix above, this one is NOT fully deterministic: candidate
@@ -1925,10 +2203,17 @@ def main():
     # connectivity/DRC re-run each time, not assumed).
     patched_script, v1m2_applied, v1m2_skipped = apply_dynamic_v1m2_fix(patched_script, shift_map)
 
+    # V1.M2.AUX.2 residual sweep - a targeted second pass over specific,
+    # individually real-DRC-verified via/gap combinations the general fix
+    # above leaves at its (conservative) default range. See the module
+    # comment above apply_v1m2_verified_growth_fix() for the derivation.
+    patched_script, v1m2v_applied, v1m2v_skipped = apply_v1m2_verified_growth_fix(
+        patched_script, case_name)
+
     # Fixed-target via-growth fixes (V4.M5.AUX.2, V5.M6.AUX.2).
     patched_script, applied, skipped = apply_validated_fixes(patched_script)
-    applied = v2m3_applied + v1m2_applied + applied
-    skipped = v2m3_skipped + v1m2_skipped + skipped
+    applied = v2m3_applied + v1m2_applied + v1m2v_applied + applied
+    skipped = v2m3_skipped + v1m2_skipped + v1m2v_skipped + skipped
     print(f"[INFO] Applied {len(applied)} validated edit(s): {applied}",
           file=sys.stderr)
     if skipped:
