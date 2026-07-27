@@ -47,7 +47,7 @@ if _env_file.exists():
         os.environ.setdefault(_key.strip(), _value.strip().strip('"').strip("'"))
 
 
-class GeminiVertexWrapper:
+class GeminiClientWrapper:
     """Uses the plain Gemini Developer API (vertexai=False), not Vertex AI
     Express Mode: the AI Studio key from the frictionless GCP account
     (billing enabled, higher quota) returns 403 API_KEY_SERVICE_BLOCKED on
@@ -126,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
             text, usage = _state["client"].generate(model, prompt, max_tokens)
             self._send_json(200, {"text": text, "diagnostics": {}, "usage": usage})
         except Exception as e:
-            self._send_json(500, {"error": str(e), "retryable": True, "provider": "vertexai"})
+            self._send_json(500, {"error": str(e), "retryable": True, "provider": "gemini-developer-api"})
 
 
 def main():
@@ -134,7 +134,7 @@ def main():
     parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()
 
-    _state["client"] = GeminiVertexWrapper()
+    _state["client"] = GeminiClientWrapper()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"[model_service] Listening on http://127.0.0.1:{args.port}", file=sys.stderr)
