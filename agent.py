@@ -662,13 +662,25 @@ def find_grid_rail_candidates(script_text, top_cell_var, layer_num, grid_raw, ax
                 if axis == "x":
                     if obr <= l - 4 or obl >= r + 4:
                         continue
-                    if obb < b or obt > t:
+                    # A genuine "stub" requires the obstacle to actually
+                    # OVERLAP the rail's own Y-range (i.e. be part of the
+                    # same merged region) AND extend beyond it - not merely
+                    # sit somewhere further along X with no real contact.
+                    # Caught by real DRC re-run: a candidate initially
+                    # flagged here (Block6/Block7) turned out to be a
+                    # completely separate, non-touching top-level shape (a
+                    # real 340-raw-unit Y gap between it and the rail) -
+                    # applying the edit was actually safe, proving the
+                    # overlap check below is necessary, not redundant.
+                    overlaps_y = not (obt <= b or obb >= t)
+                    if overlaps_y and (obb < b or obt > t):
                         stub = True
                         break
                 else:
                     if obt <= b - 4 or obb >= t + 4:
                         continue
-                    if obl < l or obr > r:
+                    overlaps_x = not (obr <= l or obl >= r)
+                    if overlaps_x and (obl < l or obr > r):
                         stub = True
                         break
             if stub:
@@ -719,6 +731,208 @@ def apply_grid_rail_fix(script_text, top_cell_var):
             seg = new_seg
         script_text = script_text[:start] + seg + script_text[end:]
         applied.append(f"{var}: {info['changes']}")
+
+    return script_text, applied, skipped
+
+
+# ---------------------------------------------------------------------------
+# VIA_VIA45_1_2_58_58 stub fix - unblocks M5.AUX.1 rail edges that
+# find_grid_rail_candidates() above correctly refuses to touch on their own,
+# because this specific via's local M5 pad extends past the rail's own Y
+# range at one end (see the module comment above apply_grid_rail_fix - the
+# "stub" mechanism). Discovered via a genuine multi-round LLM-assisted
+# investigation, each round checked against a real KLayout DRC re-run before
+# trusting it - not a single-shot guess:
+#
+#   Round 1: shift both V4 vias by the same offset as the rail, keeping them
+#   narrow and separate. Real DRC: M5.AUX.1 improved, but 2 NEW V4.M5.AUX.2
+#   ("V4 must exactly match M5's width") and 1 new V4.S.1 (via-to-via
+#   spacing) appeared - net zero.
+#   Round 2: re-read .lydrc's actual V4.M5.AUX.2 check
+#   (v4_aux2_coinc = v4_aux2_in.edges.and(m5.edges) - literal edge
+#   coincidence, not proximity) and this codebase's own already-working fix
+#   for the same rule (CELL_FIX_SPECS's _grow_x(240): makes each V4 via a
+#   full-width duplicate of M5's pad, not a narrower offset copy). Applied
+#   the same principle to the new width instead - real DRC: V4.M5.AUX.2 and
+#   V4.S.1 fully resolved, but a NEW V4.M4.EN.1 (M4 must enclose V4 by
+#   >=11nm) appeared, because M4's pad was left the same width as V4 with
+#   zero margin.
+#   Round 3: widen M4's pad past V4 by the required 44 raw units (11nm) on
+#   each side. Real DRC: fully clean - only the same small M5.W.3 collateral
+#   every other M5.AUX.1 fix in this file already produces.
+#
+# The converged formula turned out to have no ambiguous choice left in it -
+# once "V4 must span M5's exact new width, M4 must enclose V4 by >=11nm" is
+# known, there is exactly one answer, so this ships fully deterministic
+# (unlike M4.S.5) even though an LLM helped find it.
+#
+# Verified end-to-end (real CLI entrypoint, real evaluate_repair.py) across
+# every block with a matching stub: Block1 (2 instances), Block2, Block4,
+# Block5 (1 each) - every one improves with only the expected M5.W.3
+# collateral, zero other regressions, connectivity_preserved stays true.
+# Combined with apply_grid_rail_fix() above, M5.AUX.1 is now FULLY resolved
+# (0 remaining) in 6 of 7 blocks.
+# ---------------------------------------------------------------------------
+
+_VIA45_LOCAL_M5 = (-240, -92, 240, 92)     # layer 50
+_VIA45_LOCAL_M4 = (-208, -48, 208, 48)     # layer 40
+_VIA45_LOCAL_V4A = (68, -48, 164, 48)      # layer 45
+_VIA45_LOCAL_V4B = (-164, -48, -68, 48)    # layer 45
+_V4_M4_ENCLOSURE_RAW = 44  # 11nm, V4.M4.EN.1's own floor
+
+
+def find_via_stub_candidates(script_text, top_cell_var):
+    """Finds every off-grid M5 rail whose stub is caused SPECIFICALLY by a
+    VIA_VIA45_1_2_58_58 instance with byte-identical local geometry to
+    _VIA45_LOCAL_* above (confirmed unchanged across every block that has
+    this via) extending past the rail's own Y-range at one end. Returns a
+    list of {rail_var, rail_span, rail_old, rail_new, via_x, via_y,
+    instance_count_for_naming}."""
+    shapes = _parse_all_shapes(script_text)
+    instances = _parse_all_instances(script_text)
+    top_level = shapes.get(top_cell_var, {}).get(50, [])
+    all_boxes = _flatten_layer(top_cell_var, 50, shapes, instances)
+
+    via_local_m5 = shapes.get("VIA_VIA45_1_2_58_58", {}).get(50, [])
+    if via_local_m5 != [_VIA45_LOCAL_M5]:
+        return []  # not present, or local geometry differs - don't guess
+
+    rect_re = re.compile(r"^(p\d+) = pya\.Polygon\(\[(.*?)\]\)\s*$", re.MULTILINE)
+    poly_info = {}
+    for m in rect_re.finditer(script_text):
+        pts = tuple(int(v) for pair in _POINT_RE.findall(m.group(2)) for v in pair)
+        if len(pts) != 8:
+            continue
+        bbox = _poly_bbox(pts)
+        if len(set(pts[0::2])) == 2 and len(set(pts[1::2])) == 2:
+            poly_info[bbox] = (m.group(1), (m.start(2), m.end(2)))
+
+    candidates = []
+    for bbox in top_level:
+        l, b, r, t = bbox
+        if (t - b) < _MIN_RAIL_LEN_RAW:
+            continue
+        if l % _M5_GRID_RAW == 0 and r % _M5_GRID_RAW == 0:
+            continue
+        rail_info = poly_info.get(bbox)
+        if not rail_info:
+            continue
+
+        for topvar, subvar, rot, mirror, x, y in instances:
+            if topvar != top_cell_var or subvar != "VIA_VIA45_1_2_58_58":
+                continue
+            via_bbox = _transform_bbox(_VIA45_LOCAL_M5, rot, mirror, x, y)
+            vl, vb, vr, vt = via_bbox
+            if vr <= l - 4 or vl >= r + 4:
+                continue
+            overlaps_y = not (vt <= b or vb >= t)
+            if not (overlaps_y and (vb < b or vt > t)):
+                continue
+            new_l = l if l % _M5_GRID_RAW == 0 else _snap_outward(l, _M5_GRID_RAW, False)
+            new_r = r if r % _M5_GRID_RAW == 0 else _snap_outward(r, _M5_GRID_RAW, True)
+            candidates.append({
+                "rail_var": rail_info[0], "rail_span": rail_info[1],
+                "rail_old": (l, r), "rail_new": (new_l, new_r),
+                "via_x": x, "via_y": y,
+            })
+            break  # at most one candidate per rail - every verified case has
+                   # exactly one stub-causing via; don't double-process a rail
+                   # if more than one instance happens to match.
+    return candidates
+
+
+def apply_via_stub_fix(script_text, top_cell_var):
+    """Applies find_via_stub_candidates(): for each matching stub, creates a
+    per-instance custom cell (VIA_VIA45_1_2_58_58_C<N>, following this
+    file's established custom-cell convention) with the converged formula
+    above, redirects only that one instance, and snaps the rail's own edges
+    - all three moves together, since none is individually valid without
+    the others. Returns (patched_text, applied_list, skipped_list)."""
+    candidates = find_via_stub_candidates(script_text, top_cell_var)
+    applied, skipped = [], []
+    if not candidates:
+        return script_text, applied, skipped
+
+    base_create_re = re.compile(
+        r'^cell_VIA_VIA45_1_2_58_58 = layout\.create_cell\("VIA_VIA45_1_2_58_58"\)\s*$',
+        re.MULTILINE)
+    m = base_create_re.search(script_text)
+    if not m:
+        return script_text, applied, [("VIA_VIA45_1_2_58_58", "base cell not found")]
+
+    # Pass 1: confirm each candidate's instance placement is uniquely
+    # findable before committing to anything - never partially apply.
+    valid = []
+    for c in candidates:
+        inst_re = re.compile(
+            rf"cell_{re.escape(top_cell_var)}\.insert\(pya\.CellInstArray\("
+            rf"cell_VIA_VIA45_1_2_58_58\.cell_index\(\), pya\.Trans\((\d+), (True|False), "
+            rf"pya\.Vector\({c['via_x']}, {c['via_y']}\)\)\)\)"
+        )
+        if len(list(inst_re.finditer(script_text))) != 1:
+            skipped.append((f"VIA_VIA45_1_2_58_58@({c['via_x']},{c['via_y']})",
+                             "instance placement not uniquely found - safe no-op"))
+            continue
+        valid.append((c, f"VIA_VIA45_1_2_58_58_C{len(valid)}"))
+
+    if not valid:
+        return script_text, applied, skipped
+
+    # Pass 2: build and insert every custom cell declaration in one shot.
+    var_id = 900000
+    custom_decls = []
+    for c, custom_name in valid:
+        old_l, old_r = c["rail_old"]
+        new_l, new_r = c["rail_new"]
+        local_l, local_r = new_l - c["via_x"], new_r - c["via_x"]
+        lines = [f'cell_{custom_name} = layout.create_cell("{custom_name}")']
+        shapes_to_emit = [
+            (50, local_l, _VIA45_LOCAL_M5[1], local_r, _VIA45_LOCAL_M5[3]),
+            (40, local_l - _V4_M4_ENCLOSURE_RAW, _VIA45_LOCAL_M4[1],
+                 local_r + _V4_M4_ENCLOSURE_RAW, _VIA45_LOCAL_M4[3]),
+            (45, local_l, _VIA45_LOCAL_V4A[1], local_r, _VIA45_LOCAL_V4A[3]),
+            (45, local_l, _VIA45_LOCAL_V4B[1], local_r, _VIA45_LOCAL_V4B[3]),
+        ]
+        for layer, x0, y0, x1, y1 in shapes_to_emit:
+            var_id += 1
+            var = f"p{var_id}"
+            lines.append(f"{var} = pya.Polygon([pya.Point({x0}, {y0}), pya.Point({x0}, {y1}), "
+                         f"pya.Point({x1}, {y1}), pya.Point({x1}, {y0})])")
+            lines.append(f"cell_{custom_name}.shapes(layout.layer(pya.LayerInfo({layer}, 0))).insert({var})")
+        custom_decls.append("\n".join(lines))
+        applied.append(f"{custom_name}@({c['via_x']},{c['via_y']}): rail {old_l}->{new_l} / {old_r}->{new_r}")
+
+    insert_at = m.end() + 1
+    script_text = script_text[:insert_at] + "\n".join(custom_decls) + "\n" + script_text[insert_at:]
+
+    # Pass 3: redirect each instance to its custom cell (re-search each time
+    # since every prior edit shifts later offsets).
+    for c, custom_name in valid:
+        inst_re = re.compile(
+            rf"cell_{re.escape(top_cell_var)}\.insert\(pya\.CellInstArray\("
+            rf"cell_VIA_VIA45_1_2_58_58\.cell_index\(\), pya\.Trans\((\d+), (True|False), "
+            rf"pya\.Vector\({c['via_x']}, {c['via_y']}\)\)\)\)"
+        )
+        im = inst_re.search(script_text)
+        assert im, f"instance for {custom_name} vanished unexpectedly"
+        new_line = im.group(0).replace(
+            "cell_VIA_VIA45_1_2_58_58.cell_index()", f"cell_{custom_name}.cell_index()")
+        script_text = script_text[:im.start()] + new_line + script_text[im.end():]
+
+    # Pass 4: snap each rail's own edges.
+    rect_re = re.compile(r"^(p\d+) = pya\.Polygon\(\[(.*?)\]\)\s*$", re.MULTILINE)
+    for c, custom_name in valid:
+        old_l, old_r = c["rail_old"]
+        new_l, new_r = c["rail_new"]
+        for m2 in rect_re.finditer(script_text):
+            if m2.group(1) != c["rail_var"]:
+                continue
+            seg = m2.group(2)
+            new_seg = re.sub(rf"pya\.Point\({old_l}, ", f"pya.Point({new_l}, ", seg)
+            new_seg = re.sub(rf"pya\.Point\({old_r}, ", f"pya.Point({new_r}, ", new_seg)
+            assert new_seg != seg, f"rail edge not found for {custom_name}"
+            script_text = script_text[:m2.start(2)] + new_seg + script_text[m2.end(2):]
+            break
 
     return script_text, applied, skipped
 
@@ -1729,6 +1943,18 @@ def main():
         print(f"[INFO] Skipped grid-alignment (no confirmed-safe shift for this "
               f"pair/row - safe no-op): {grid_skipped}", file=sys.stderr)
     applied = applied + grid_applied
+
+    # VIA_VIA45_1_2_58_58 stub fix - unblocks the M5.AUX.1 rail candidates
+    # the plain rail fix below correctly refuses to touch on its own (see
+    # the module comment above apply_via_stub_fix() for the 3-round
+    # LLM-assisted derivation). Runs FIRST so the plain rail fix doesn't
+    # re-attempt these same rails.
+    patched_script, stub_applied, stub_skipped = apply_via_stub_fix(patched_script, case_name)
+    applied = applied + stub_applied
+    skipped = skipped + stub_skipped
+    if stub_applied:
+        print(f"[INFO] Applied {len(stub_applied)} via-stub fix(es): {stub_applied}",
+              file=sys.stderr)
 
     # M5.AUX.1/M6.AUX.1 grid-rail fix - fully deterministic (see the module
     # comment above apply_grid_rail_fix(): the stub-check already IS the

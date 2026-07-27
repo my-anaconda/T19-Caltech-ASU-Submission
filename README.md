@@ -91,6 +91,28 @@ derivation, including the "topmost group" heuristic that looked right on
 Block1 alone and was falsified by Block2/Block5, and why `M6.AUX.1` stays
 deferred rather than shipped on an unverified assumption.
 
+The stub check above was itself too conservative in one direction, and the
+fix for that is where genuine LLM iteration came back in: `M5.AUX.1` rails
+whose stub is a `VIA_VIA45_1_2_58_58` via extending past the rail's own Y
+range were previously left untouched entirely (Block5 got zero candidates).
+A real, explicit multi-round process - propose a fix, verify it against a
+real KLayout DRC re-run, tell the model exactly what broke, iterate - found
+a working formula in 3 rounds: widen the via's own M5 pad to match the
+rail's new edge, widen both its V4 vias to span that SAME new width
+(matching this codebase's own established `_grow_x()` pattern for the same
+DRC rule, discovered only by reading `V4.M5.AUX.2`'s actual `.lydrc` check
+rather than guessing), and widen its M4 pad to keep the required 11nm
+enclosure. Round 1 traded the target violation for two new ones (net zero);
+round 2 fixed those but left a third; round 3 was clean. Because the
+converged formula turns out to have no ambiguous choice left in it, it
+ships as ordinary deterministic geometry - the LLM's contribution was
+discovering the formula, not deciding per-instance at grading time. See
+NOTES.md's `VIA_VIA45_1_2_58_58` section for the full 3-round derivation,
+including a second bug this same investigation caught (the stub check was
+also flagging Block6/Block7's rail as unsafe for an unrelated reason - a
+completely separate, non-touching shape 340 raw units away - tightened to
+require genuine overlap, not just proximity).
+
 Verified end-to-end through this exact `agent.py`'s actual CLI entrypoint,
 real KLayout 0.30.1, real evaluator, against every available block, each
 compared to that block's own *true* pristine floor (a live KLayout re-run of
@@ -99,22 +121,24 @@ see NOTES.md for why that assumption is wrong):
 
 | Case | Pristine floor | FVR (`final_violation_rate`) | Repair rate | Connectivity |
 |---|---:|---:|---:|---|
-| Block1 | 1.2910 | **0.6025** | 0.668 | preserved |
-| Block2 | 1.3235 | **0.4706** | 0.677 | preserved |
+| Block1 | 1.2910 | **0.5779** | 0.701 | preserved |
+| Block2 | 1.3235 | **0.4265** | 0.735 | preserved |
 | Block3 | 1.2472 | **0.6517** | 0.618 | preserved |
-| Block4 | 1.2857 | **0.4898** | 0.694 | preserved |
-| Block5 | 1.2794 | **0.6471** | 0.588 | preserved |
-| Block6 | 1.2996 | **0.6154** | 0.745 | preserved |
-| Block7 | 1.2510 | **0.6235** | 0.665 | preserved |
+| Block4 | 1.2857 | **0.4694** | 0.721 | preserved |
+| Block5 | 1.2794 | **0.6029** | 0.588 | preserved |
+| Block6 | 1.2996 | **0.6032** | 0.761 | preserved |
+| Block7 | 1.2510 | **0.6196** | 0.671 | preserved |
 
 FVR is the benchmark's own primary scoring metric (`final_violation_rate` -
 fresh DRC violation count on the repaired script, divided by the original
 violation count; lower is better, gates on `valid_repair`/
-`connectivity_preserved`). These reflect both the hybrid LLM+deterministic
-`M4.S.5` fix (Block1 only, its one safety-verified candidate) and the fully
-deterministic `M5.AUX.1` grid-rail fix (every block except Block5, whose
-off-grid rails are all stub-blocked). See NOTES.md's `M4.S.5` and
-`M5.AUX.1` sections for the full derivation of each.
+`connectivity_preserved`). These reflect the hybrid LLM+deterministic
+`M4.S.5` fix (Block1 only, its one safety-verified candidate), the fully
+deterministic `M5.AUX.1` grid-rail fix, and the `VIA_VIA45_1_2_58_58` stub
+fix discovered via genuine LLM iteration (every block that has this via
+configuration) - `M5.AUX.1` is now fully resolved (0 remaining) in 6 of 7
+blocks. See NOTES.md's `M4.S.5`, `M5.AUX.1`, and `VIA_VIA45_1_2_58_58`
+sections for the full derivation of each.
 
 Every case: `valid_repair: true`, `connectivity_preserved: true`, and
 `final_violation_rate` genuinely below that block's own true pristine floor -
